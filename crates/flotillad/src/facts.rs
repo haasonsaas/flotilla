@@ -62,7 +62,11 @@ pub fn collect(state: &AppState) -> NodeFacts {
             .unwrap_or(0),
         load_1m: System::load_average().one,
         mem_total_mb: sys.total_memory() / (1024 * 1024),
-        mem_free_mb: sys.available_memory() / (1024 * 1024),
+        // sysinfo reports available_memory() as 0 on macOS; fall back to total - used.
+        mem_free_mb: match sys.available_memory() {
+            0 => sys.total_memory().saturating_sub(sys.used_memory()) / (1024 * 1024),
+            a => a / (1024 * 1024),
+        },
         disk_total_gb: root.map(|d| d.total_space() / 1_000_000_000).unwrap_or(0),
         disk_free_gb: root
             .map(|d| d.available_space() / 1_000_000_000)
