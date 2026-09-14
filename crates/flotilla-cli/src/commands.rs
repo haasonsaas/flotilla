@@ -37,6 +37,11 @@ pub async fn status(c: &Client, json: bool) -> Result<()> {
     if json {
         return print_json(&st);
     }
+    let sync: BTreeMap<String, PeerSyncState> = c
+        .sync_state()
+        .await
+        .map(|r| r.peers.into_iter().map(|p| (p.key.clone(), p)).collect())
+        .unwrap_or_default();
     let mut t = Table::new();
     t.load_preset(UTF8_FULL_CONDENSED);
     t.set_header([
@@ -77,6 +82,21 @@ pub async fn status(c: &Client, json: bool) -> Result<()> {
         } else {
             f.name.clone()
         };
+        let synced = if f.node_id == st.me {
+            Cell::new("-")
+        } else {
+            match sync.get(&f.node_id) {
+                Some(p) if p.consecutive_failures > 0 => {
+                    Cell::new(format!("failing x{}", p.consecutive_failures)).fg(Color::Red)
+                }
+                Some(p) => Cell::new(
+                    p.last_ok_ms
+                        .map(|t| ms_ago(t) + " ago")
+                        .unwrap_or_else(|| "never".into()),
+                ),
+                None => Cell::new("never").fg(Color::DarkGrey),
+            }
+        };
         t.add_row(vec![
             Cell::new(name),
             state,
@@ -90,6 +110,7 @@ pub async fn status(c: &Client, json: bool) -> Result<()> {
             Cell::new(f.running_jobs.len()),
             Cell::new(labels.join(",")),
             Cell::new(age(n.facts_age_secs)),
+            synced,
         ]);
     }
     println!("{t}");
@@ -133,6 +154,40 @@ pub async fn peers(c: &Client, json: bool) -> Result<()> {
     println!("{t}");
     if offline > 0 {
         println!("({offline} offline peers hidden; --json shows all)");
+    }
+    Ok(())
+}
+
+pub async fn sync(c: &Client, peer: Option<String>, json: bool) -> Result<()> {
+    let results = c.sync_now(peer).await?;
+    if json {
+        return print_json(&results);
+    }
+    if results.is_empty() {
+        bail!("no matching sync candidates (online peers or seeds)");
+    }
+    let mut t = Table::new();
+    t.load_preset(UTF8_FULL_CONDENSED);
+    t.set_header(["peer", "url", "result", "pulled", "pushed"]);
+    let mut failed = false;
+    for r in results {
+        let cell = if r.ok {
+            Cell::new("ok").fg(Color::Green)
+        } else {
+            failed = true;
+            Cell::new(r.error.clone().unwrap_or_default()).fg(Color::Red)
+        };
+        t.add_row(vec![
+            Cell::new(r.name),
+            Cell::new(r.url),
+            cell,
+            Cell::new(r.pulled),
+            Cell::new(r.pushed),
+        ]);
+    }
+    println!("{t}");
+    if failed {
+        std::process::exit(1);
     }
     Ok(())
 }

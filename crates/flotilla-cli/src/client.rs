@@ -64,6 +64,21 @@ impl Client {
         self.get("/v1/peers").await
     }
 
+    pub async fn sync_state(&self) -> Result<SyncStateResponse> {
+        self.get("/v1/syncstate").await
+    }
+
+    pub async fn sync_now(&self, peer: Option<String>) -> Result<Vec<SyncNowResult>> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/syncnow", self.base))
+            .json(&SyncNowRequest { peer })
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
     pub async fn list(&self, prefix: &str, raw: bool) -> Result<Vec<Record>> {
         let r: RecordsResponse = self
             .get(&format!(

@@ -34,6 +34,8 @@ enum Cmd {
     Whoami,
     /// List Tailscale peers as seen by the local daemon
     Peers,
+    /// Force a sync round with one peer (name, id, or seed address) or with everyone
+    Sync { peer: Option<String> },
     /// Run a command on selected nodes and stream the output
     Run(commands::RunArgs),
     /// Durable jobs: submitted into the replicated store, run by whichever eligible node claims them
@@ -63,6 +65,7 @@ async fn main() -> Result<()> {
         Cmd::Status => commands::status(&client, cli.json).await,
         Cmd::Whoami => commands::whoami(&client, cli.json).await,
         Cmd::Peers => commands::peers(&client, cli.json).await,
+        Cmd::Sync { peer } => commands::sync(&client, peer, cli.json).await,
         Cmd::Run(args) => commands::run(&client, args).await,
         Cmd::Job(cmd) => commands::job(&client, cmd, cli.json).await,
         Cmd::Desired(cmd) => commands::desired(&client, cmd, cli.json).await,

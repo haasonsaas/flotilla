@@ -123,3 +123,40 @@ mod tests {
         assert_eq!(peer_url(&ips, 1).unwrap(), "http://100.1.2.3:1");
     }
 }
+
+/// The local daemon's view of its sync relationship with one peer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PeerSyncState {
+    /// Node id for discovered peers, the seed address for seeds.
+    pub key: String,
+    pub name: String,
+    pub url: String,
+    pub last_ok_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_error_ms: Option<u64>,
+    pub consecutive_failures: u32,
+    /// Unix ms before which the peer will not be retried.
+    pub next_try_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncStateResponse {
+    pub peers: Vec<PeerSyncState>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SyncNowRequest {
+    /// Node name, node id, or seed address. None = every candidate.
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncNowResult {
+    pub name: String,
+    pub url: String,
+    pub ok: bool,
+    pub pulled: usize,
+    pub pushed: usize,
+    pub error: Option<String>,
+}

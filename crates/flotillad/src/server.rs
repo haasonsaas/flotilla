@@ -34,6 +34,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Jobs currently executing on this node, with their cancel tokens.
     pub running: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Per-peer sync bookkeeping, keyed like `sync_loop::Candidate::key`.
+    pub sync_state: Arc<Mutex<HashMap<String, PeerSyncState>>>,
 }
 
 impl AppState {
@@ -108,6 +110,8 @@ pub fn router(state: AppState) -> Router {
             get(get_record).put(put_record).delete(delete_record),
         )
         .route("/v1/sync", post(post_sync))
+        .route("/v1/syncstate", get(get_sync_state))
+        .route("/v1/syncnow", post(post_sync_now))
         .route("/v1/exec", post(post_exec))
         .route("/v1/jobs/{id}/log", get(get_job_log))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -283,6 +287,32 @@ async fn post_sync(
     let reply =
         tokio::task::spawn_blocking(move || flotilla_core::sync::respond(&store, &msg)).await??;
     Ok(Json(reply))
+}
+
+async fn get_sync_state(State(state): State<AppState>) -> Json<SyncStateResponse> {
+    let mut peers: Vec<PeerSyncState> =
+        state.sync_state.lock().unwrap().values().cloned().collect();
+    peers.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(SyncStateResponse { peers })
+}
+
+async fn post_sync_now(
+    State(state): State<AppState>,
+    Json(req): Json<SyncNowRequest>,
+) -> ApiResult<Json<Vec<SyncNowResult>>> {
+    let all = crate::sync_loop::candidates(&state).await?;
+    let selected: Vec<_> = match &req.peer {
+        Some(p) => all
+            .into_iter()
+            .filter(|c| &c.key == p || &c.name == p || &c.url == p)
+            .collect(),
+        None => all,
+    };
+    let mut out = Vec::new();
+    for c in &selected {
+        out.push(crate::sync_loop::sync_candidate(&state, c).await);
+    }
+    Ok(Json(out))
 }
 
 async fn post_exec(
