@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/flotilla-core", "crates/flotillad", "crates/flotilla-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/haasonsaas/flotilla"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+redb = "4"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.9"
+axum = { version = "0.8", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.9"
+sysinfo = "0.37"
+directories = "6"
+chrono = { version = "0.4", features = ["serde"] }
+comfy-table = "7"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
