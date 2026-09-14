@@ -57,6 +57,7 @@ impl AppState {
             me,
             http,
             running: Arc::new(Mutex::new(HashMap::new())),
+            sync_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
