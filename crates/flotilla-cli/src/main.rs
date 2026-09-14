@@ -16,9 +16,9 @@ use flotilla_core::api::DEFAULT_PORT;
     about = "Coordinate a fleet of machines over Tailscale"
 )]
 struct Cli {
-    /// Base URL of the local daemon
-    #[arg(long, global = true, env = "FLOTILLA_DAEMON", default_value_t = format!("http://127.0.0.1:{DEFAULT_PORT}"))]
-    daemon: String,
+    /// Base URL of the local daemon (default: loopback on the port in ~/.config/flotilla/config.toml, else 7400)
+    #[arg(long, global = true, env = "FLOTILLA_DAEMON")]
+    daemon: Option<String>,
     /// Emit JSON instead of tables
     #[arg(long, global = true)]
     json: bool,
@@ -54,7 +54,11 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = client::Client::new(&cli.daemon);
+    let daemon = cli
+        .daemon
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", configured_port()));
+    let client = client::Client::new(&daemon);
     match cli.cmd {
         Cmd::Status => commands::status(&client, cli.json).await,
         Cmd::Whoami => commands::whoami(&client, cli.json).await,
@@ -66,4 +70,18 @@ async fn main() -> Result<()> {
         Cmd::Install(args) => install::install(args),
         Cmd::Uninstall => install::uninstall(),
     }
+}
+
+/// Port from the daemon config file, so the CLI follows a non-default port
+/// without flags. Only the `port` key is read.
+fn configured_port() -> u16 {
+    let path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".config")))
+        .map(|d| d.join("flotilla").join("config.toml"));
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| t.parse::<toml::Table>().ok())
+        .and_then(|t| t.get("port").and_then(|v| v.as_integer()))
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(DEFAULT_PORT)
 }
