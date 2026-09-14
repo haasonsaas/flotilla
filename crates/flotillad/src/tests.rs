@@ -34,6 +34,7 @@ async fn node(name: &str, port: u16, peers: Vec<(&str, u16)>, dir: &std::path::P
         data_dir: dir.join(name),
         identity: "static".into(),
         sync_interval_secs: 1,
+        job_lease_secs: 3,
         facts_interval_secs: 1,
         scheduler_interval_secs: 1,
         reconcile_interval_secs: 1,
@@ -398,5 +399,154 @@ async fn desired_state_converges_and_reports() {
             .unwrap_or(false)
     })
     .await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_lease_is_taken_over() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let spec = JobSpec {
+        id: id.clone(),
+        cmd: vec!["sh".into(), "-c".into(), "echo recovered".into()],
+        cwd: None,
+        env: Default::default(),
+        selector: Default::default(),
+        node: None,
+        submitted_by: "test".into(),
+        submitted_at_ms: flotilla_core::now_ms(),
+        timeout_secs: Some(30),
+        cancelled: false,
+    };
+    a.state.store.put_json(&keys::job(&id), &spec).unwrap();
+    // A claim from a node that died: lease already in the past.
+    let dead = JobClaim {
+        job_id: id.clone(),
+        node: "id-dead".into(),
+        claimed_at_ms: 1,
+        lease_until_ms: 1,
+        attempt: 1,
+    };
+    a.state
+        .store
+        .merge(&flotilla_core::Record {
+            key: keys::claim(&id),
+            value: serde_json::to_value(&dead).unwrap(),
+            author: "id-dead".into(),
+            hlc: flotilla_core::Hlc::from_parts(1, 0),
+            deleted: false,
+        })
+        .unwrap();
+    eventually("taken over and finished", || {
+        a.state.store.get(&keys::result(&id)).unwrap().is_some()
+    })
+    .await;
+    let claim: JobClaim = a
+        .state
+        .store
+        .get(&keys::claim(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(claim.node, "id-solo");
+    assert_eq!(claim.attempt, 2);
+    let result: JobResult = a
+        .state
+        .store
+        .get(&keys::result(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.output_tail.contains("recovered"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let spec = JobSpec {
+        id: id.clone(),
+        cmd: vec!["tail".into(), "-f".into(), "/dev/null".into()],
+        cwd: None,
+        env: Default::default(),
+        selector: Default::default(),
+        node: Some("solo".into()),
+        submitted_by: "test".into(),
+        submitted_at_ms: flotilla_core::now_ms(),
+        timeout_secs: None,
+        cancelled: false,
+    };
+    a.state.store.put_json(&keys::job(&id), &spec).unwrap();
+    eventually("claimed", || {
+        a.state.store.get(&keys::claim(&id)).unwrap().is_some()
+    })
+    .await;
+    let first: JobClaim = a
+        .state
+        .store
+        .get(&keys::claim(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Lease is 3s and renewal happens every 1s once running (after the settle window).
+    eventually("lease renewed", || {
+        a.state
+            .store
+            .get(&keys::claim(&id))
+            .unwrap()
+            .and_then(|r| r.parse::<JobClaim>().ok())
+            .map(|c| c.lease_until_ms > first.lease_until_ms)
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(a.state.running.lock().unwrap().contains_key(&id));
+    // Another node steals the claim with a newer record. The executor must
+    // stop and must not write a result.
+    let now = flotilla_core::now_ms();
+    let thief = JobClaim {
+        job_id: id.clone(),
+        node: "id-other".into(),
+        claimed_at_ms: now,
+        lease_until_ms: now + 600_000,
+        attempt: 2,
+    };
+    a.state
+        .store
+        .merge(&flotilla_core::Record {
+            key: keys::claim(&id),
+            value: serde_json::to_value(&thief).unwrap(),
+            author: "zzzz-other".into(),
+            hlc: flotilla_core::Hlc::from_parts(now + 5_000, 0),
+            deleted: false,
+        })
+        .unwrap();
+    eventually("executor stopped", || {
+        !a.state.running.lock().unwrap().contains_key(&id)
+    })
+    .await;
+    assert!(
+        a.state.store.get(&keys::result(&id)).unwrap().is_none(),
+        "a stopped executor writes no result"
+    );
+    let claim: JobClaim = a
+        .state
+        .store
+        .get(&keys::claim(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(claim.node, "id-other");
     std::fs::remove_dir_all(dir).ok();
 }

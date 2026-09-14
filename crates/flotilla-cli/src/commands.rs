@@ -459,7 +459,12 @@ async fn load_jobs(c: &Client) -> Result<Vec<JobView>> {
         };
         let claim = claims.get(&spec.id).cloned();
         let result = results.get(&spec.id).cloned();
-        let state = JobState::derive(&spec, claim.as_ref(), result.as_ref());
+        let state = JobState::derive_at(
+            &spec,
+            claim.as_ref(),
+            result.as_ref(),
+            flotilla_core::now_ms(),
+        );
         out.push(JobView {
             spec,
             claim,
@@ -550,6 +555,7 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
                     JobState::Succeeded => Cell::new("succeeded").fg(Color::Green),
                     JobState::Failed => Cell::new("failed").fg(Color::Red),
                     JobState::Claimed => Cell::new("running").fg(Color::Yellow),
+                    JobState::Orphaned => Cell::new("orphaned").fg(Color::Red),
                     JobState::Pending => Cell::new("pending"),
                     JobState::Cancelled => Cell::new("cancelled").fg(Color::DarkGrey),
                 };
@@ -619,10 +625,20 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
                 println!("selector:  {}", j.spec.selector);
             }
             if let Some(cl) = &j.claim {
+                let now = flotilla_core::now_ms();
+                let lease = if cl.lease_until_ms == 0 {
+                    "no lease".to_string()
+                } else if cl.lease_until_ms > now {
+                    format!("lease {}s left", (cl.lease_until_ms - now) / 1000)
+                } else {
+                    format!("lease expired {} ago", ms_ago(cl.lease_until_ms))
+                };
                 println!(
-                    "claimed:   {} ({} ago)",
+                    "claimed:   {} ({} ago, attempt {}, {})",
                     names.get(&cl.node).unwrap_or(&cl.node),
-                    ms_ago(cl.claimed_at_ms)
+                    ms_ago(cl.claimed_at_ms),
+                    cl.attempt,
+                    lease
                 );
             }
             if let Some(r) = &j.result {
@@ -721,7 +737,12 @@ async fn wait(c: &Client, id: &str, json: bool) -> Result<()> {
             .await?
             .map(|r| r.parse::<JobResult>())
             .transpose()?;
-        let state = JobState::derive(&spec, claim.as_ref(), result.as_ref());
+        let state = JobState::derive_at(
+            &spec,
+            claim.as_ref(),
+            result.as_ref(),
+            flotilla_core::now_ms(),
+        );
         if last_state != Some(state) && !json {
             eprintln!("{id}: {state:?}");
             last_state = Some(state);

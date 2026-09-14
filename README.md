@@ -53,6 +53,11 @@ allowed_tags  = ["tag:fleet"]
 [labels]
 gpu = "yes"
 role = "builder"
+
+# Peers to bootstrap from when discovery alone isn't enough, e.g. a node whose
+# Tailscale ACL only admits a non-default port. Known peers are always dialed
+# on the port they advertise.
+seeds = ["100.100.185.44:50051"]
 ```
 
 All keys and defaults are in `crates/flotillad/src/config.rs`.
@@ -60,7 +65,8 @@ All keys and defaults are in `crates/flotillad/src/config.rs`.
 ## Usage
 
 ```sh
-flotilla status                              # every node, online or not
+flotilla status                              # every node, online or not, with last sync per peer
+flotilla sync                                # force a sync round with every candidate peer
 flotilla run -n mac-mini -n olympus -- df -h /
 flotilla run -l os=macos --timeout 60 -- brew outdated
 flotilla job submit --wait -l arch=x86_64 -- cargo test
@@ -94,8 +100,17 @@ apply = ["brew", "install", "jq"]
 4. The winner runs the job, streams the log to a local file, and writes `result/<id>` with the exit code and the last 4 KiB of output.
 5. `job show` reads the result from any node. `job logs` fetches the full log from the executor.
 
+Claims carry a lease (`job_lease_secs`, default 60). The executor renews it at a
+third of that interval while the job runs. If a lease lapses with no result,
+because the executor died or lost its network, any eligible node takes the job
+over with a new claim (`attempt` increments, and `job ls` shows the gap as
+`orphaned` until then). An executor that sees another node's claim on its job
+kills the process and writes no result, so ownership converges even after a
+partition heals.
+
 This is at-least-once: a node partitioned for longer than the settle window can
-also run the job. That's the trade for having no coordinator.
+also run the job, and a takeover can overlap with an executor that is alive but
+unreachable. That's the trade for having no coordinator.
 
 ## Layout
 

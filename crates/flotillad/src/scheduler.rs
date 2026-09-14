@@ -1,5 +1,12 @@
 //! Leaderless job scheduling. Every node runs this loop; claims are LWW
 //! records, so after one settle window all nodes agree on the executor.
+//!
+//! Claims carry a lease. The executor renews it while the job runs; if the
+//! lease lapses (plus a grace window) with no result, any eligible node
+//! takes the job over with a new claim. An executor that observes someone
+//! else's claim on its job kills the process and writes no result, so
+//! ownership converges to one node even after partitions. Jobs are
+//! at-least-once.
 
 use crate::exec::{self, Tail};
 use crate::server::{pause, AppState};
@@ -22,10 +29,45 @@ pub async fn run(state: AppState) {
     }
 }
 
+fn current_claim(state: &AppState, id: &str) -> Option<JobClaim> {
+    state
+        .store
+        .get(&keys::claim(id))
+        .ok()
+        .flatten()
+        .and_then(|r| r.parse().ok())
+}
+
+fn job_cancelled(state: &AppState, id: &str) -> bool {
+    state
+        .store
+        .get(&keys::job(id))
+        .ok()
+        .flatten()
+        .and_then(|r| r.parse::<JobSpec>().ok())
+        .map(|s| s.cancelled)
+        .unwrap_or(true)
+}
+
+fn write_claim(state: &AppState, id: &str, attempt: u32) -> anyhow::Result<JobClaim> {
+    let now = flotilla_core::now_ms();
+    let claim = JobClaim {
+        job_id: id.to_string(),
+        node: state.me.node_id.clone(),
+        claimed_at_ms: now,
+        lease_until_ms: now + state.cfg.lease().as_millis() as u64,
+        attempt,
+    };
+    state.store.put_json(&keys::claim(id), &claim)?;
+    Ok(claim)
+}
+
 async fn tick(state: &AppState) -> anyhow::Result<()> {
     let Some(facts) = state.my_facts() else {
         return Ok(());
     };
+    let now = flotilla_core::now_ms();
+    let grace = state.cfg.lease_grace().as_millis() as u64;
     for rec in state.store.list(keys::JOB)? {
         let spec: JobSpec = match rec.parse() {
             Ok(s) => s,
@@ -47,27 +89,26 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         if !eligible {
             continue;
         }
-        match state
-            .store
-            .get(&keys::claim(&spec.id))?
-            .map(|r| r.parse::<JobClaim>())
-            .transpose()?
-        {
+        let has_capacity = state.running.lock().unwrap().len() < state.cfg.max_concurrent_jobs;
+        match current_claim(state, &spec.id) {
             Some(claim) if claim.node == state.me.node_id => {
-                // Ours (e.g. after a restart) but not running: run it now.
+                // Ours (e.g. after a restart) but not running: resume it.
+                tracing::info!(job = %spec.id, "resuming own claim");
+                write_claim(state, &spec.id, claim.attempt)?;
                 start(state.clone(), spec, false);
             }
-            Some(_) => {}
+            Some(claim) => {
+                if has_capacity && now > claim.lease_until_ms.saturating_add(grace) {
+                    tracing::warn!(job = %spec.id, holder = %claim.node, attempt = claim.attempt + 1, "lease expired, taking over");
+                    write_claim(state, &spec.id, claim.attempt + 1)?;
+                    start(state.clone(), spec, true);
+                }
+            }
             None => {
-                if state.running.lock().unwrap().len() >= state.cfg.max_concurrent_jobs {
+                if !has_capacity {
                     continue;
                 }
-                let claim = JobClaim {
-                    job_id: spec.id.clone(),
-                    node: state.me.node_id.clone(),
-                    claimed_at_ms: flotilla_core::now_ms(),
-                };
-                state.store.put_json(&keys::claim(&spec.id), &claim)?;
+                write_claim(state, &spec.id, 1)?;
                 tracing::info!(job = %spec.id, "claimed, settling");
                 start(state.clone(), spec, true);
             }
@@ -87,13 +128,7 @@ fn start(state: AppState, spec: JobSpec, settle: bool) {
         let id = spec.id.clone();
         if settle {
             pause(state.cfg.settle_window()).await;
-            let winner = state
-                .store
-                .get(&keys::claim(&id))
-                .ok()
-                .flatten()
-                .and_then(|r| r.parse::<JobClaim>().ok());
-            match winner {
+            match current_claim(&state, &id) {
                 Some(c) if c.node == state.me.node_id => {}
                 other => {
                     tracing::info!(job = %id, winner = ?other.map(|c| c.node), "lost claim");
@@ -102,30 +137,32 @@ fn start(state: AppState, spec: JobSpec, settle: bool) {
                 }
             }
         }
-        // A cancel may have landed during settling.
-        let cancelled_now = state
-            .store
-            .get(&keys::job(&id))
-            .ok()
-            .flatten()
-            .and_then(|r| r.parse::<JobSpec>().ok())
-            .map(|s| s.cancelled)
-            .unwrap_or(true);
-        if cancelled_now {
+        if job_cancelled(&state, &id) {
             state.running.lock().unwrap().remove(&id);
             return;
         }
         tracing::info!(job = %id, cmd = ?spec.cmd, "running");
-        let result = execute(&state, &spec, cancel).await;
-        if let Err(e) = state.store.put_json(&keys::result(&id), &result) {
-            tracing::error!(job = %id, error = %e, "writing result");
+        match execute(&state, &spec, cancel).await {
+            Outcome::Finished(result) => {
+                if let Err(e) = state.store.put_json(&keys::result(&id), &result) {
+                    tracing::error!(job = %id, error = %e, "writing result");
+                }
+                tracing::info!(job = %id, exit = ?result.exit_code, "finished");
+            }
+            Outcome::LostOwnership(to) => {
+                tracing::warn!(job = %id, to = %to, "stopped: another node holds the claim");
+            }
         }
-        tracing::info!(job = %id, exit = ?result.exit_code, "finished");
         state.running.lock().unwrap().remove(&id);
     });
 }
 
-async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) -> JobResult {
+enum Outcome {
+    Finished(JobResult),
+    LostOwnership(String),
+}
+
+async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) -> Outcome {
     let started = flotilla_core::now_ms();
     let req = ExecRequest {
         cmd: spec.cmd.clone(),
@@ -141,25 +178,40 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
     let mut exit = None;
     let mut error = None;
 
-    // Watch for cancellation written by any node.
-    let watcher = {
+    // Lease keeper: renew our claim while running, kill the job if a cancel
+    // lands or if another node now holds the claim.
+    let lost = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let keeper = {
         let state = state.clone();
         let id = spec.id.clone();
         let cancel = cancel.clone();
+        let lost = lost.clone();
+        let renew_every = state.cfg.lease() / 3;
         tokio::spawn(async move {
+            let mut since_renew = Duration::ZERO;
+            let step = Duration::from_secs(1);
             loop {
-                pause(Duration::from_secs(1)).await;
-                let cancelled = state
-                    .store
-                    .get(&keys::job(&id))
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.parse::<JobSpec>().ok())
-                    .map(|s| s.cancelled)
-                    .unwrap_or(false);
-                if cancelled {
+                pause(step).await;
+                since_renew += step;
+                if job_cancelled(&state, &id) {
                     cancel.cancel();
                     return;
+                }
+                match current_claim(&state, &id) {
+                    Some(c) if c.node == state.me.node_id => {
+                        if since_renew >= renew_every {
+                            since_renew = Duration::ZERO;
+                            if let Err(e) = write_claim(&state, &id, c.attempt) {
+                                tracing::warn!(job = %id, error = %e, "lease renewal failed");
+                            }
+                        }
+                    }
+                    other => {
+                        *lost.lock().unwrap() =
+                            Some(other.map(|c| c.node).unwrap_or_else(|| "nobody".into()));
+                        cancel.cancel();
+                        return;
+                    }
                 }
             }
         })
@@ -177,11 +229,14 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
             ExecFrame::Exit { code } => exit = *code,
         }
     }
-    watcher.abort();
+    keeper.abort();
     if let Some(f) = log.as_mut() {
         let _ = f.flush().await;
     }
-    JobResult {
+    if let Some(to) = lost.lock().unwrap().take() {
+        return Outcome::LostOwnership(to);
+    }
+    Outcome::Finished(JobResult {
         job_id: spec.id.clone(),
         node: state.me.node_id.clone(),
         exit_code: exit,
@@ -189,5 +244,5 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
         finished_at_ms: flotilla_core::now_ms(),
         output_tail: tail.into_string(),
         error,
-    }
+    })
 }

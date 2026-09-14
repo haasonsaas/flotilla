@@ -18,6 +18,9 @@ pub struct Config {
     /// Path to the tailscale CLI. Auto-detected if unset.
     pub tailscale_bin: Option<PathBuf>,
     pub max_concurrent_jobs: usize,
+    /// How long a claim stays valid without renewal. Executors renew at a
+    /// third of this; a lapsed lease lets another node take the job over.
+    pub job_lease_secs: u64,
     pub sync_interval_secs: u64,
     pub facts_interval_secs: u64,
     pub scheduler_interval_secs: u64,
@@ -68,6 +71,7 @@ impl Default for Config {
             labels: Labels::new(),
             tailscale_bin: None,
             max_concurrent_jobs: 2,
+            job_lease_secs: 60,
             sync_interval_secs: 3,
             facts_interval_secs: 15,
             scheduler_interval_secs: 3,
@@ -128,5 +132,15 @@ impl Config {
 
     pub fn settle_window(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sync_interval_secs * 2 + 1)
+    }
+
+    pub fn lease(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.job_lease_secs.max(3))
+    }
+
+    /// Extra time past lease expiry before takeover, so a renewal in flight
+    /// through sync is not mistaken for a dead executor.
+    pub fn lease_grace(&self) -> std::time::Duration {
+        self.settle_window()
     }
 }

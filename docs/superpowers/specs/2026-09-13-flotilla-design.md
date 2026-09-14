@@ -57,6 +57,10 @@ A last-writer-wins key/value map replicated by anti-entropy sync.
   3. A merges, then sends B the records B lacks.
 - Sync runs every 3s against a random online peer. Convergence follows from
   LWW being commutative, associative and idempotent.
+- Peers that fail back off exponentially (capped at 5 minutes). Per-peer
+  state is exposed on `/v1/syncstate`; `/v1/syncnow` forces a round.
+- Known peers are dialed on the port in their facts record. `seeds` in the
+  config bootstrap peers that discovery cannot reach on the default port.
 - Deletes are tombstones. Garbage collection is future work.
 - Persistence: redb, one file per node under the data dir.
 
@@ -89,6 +93,12 @@ by the CLI for fan-out and by the job runner.
    with exit code and the last 4 KiB of output.
 5. `job logs` fetches the full log from the executor via `/v1/jobs/<id>/log`.
 6. Cancel = rewrite `job/<id>` with `cancelled: true`; the executor polls it.
+7. Leases (added 2026-09-14): `claim/<id>` carries `lease_until_ms` and
+   `attempt`. The executor renews the lease at a third of `job_lease_secs`
+   while running. A claim whose lease lapsed by more than one settle window
+   with no result may be re-claimed by any eligible node. An executor that
+   observes a claim held by another node kills its process and writes no
+   result.
 
 ### Desired state
 

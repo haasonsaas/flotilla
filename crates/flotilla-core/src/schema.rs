@@ -61,6 +61,24 @@ pub struct JobClaim {
     pub job_id: String,
     pub node: String,
     pub claimed_at_ms: u64,
+    /// The executor renews this while it holds the job. Once it is in the
+    /// past (plus a grace window) and there is still no result, any eligible
+    /// node may take the job over. Zero means an unleased legacy claim.
+    #[serde(default)]
+    pub lease_until_ms: u64,
+    /// How many times the job has been (re)claimed.
+    #[serde(default = "one")]
+    pub attempt: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+impl JobClaim {
+    pub fn lease_expired_at(&self, now_ms: u64) -> bool {
+        now_ms > self.lease_until_ms
+    }
 }
 
 /// `result/<id>`: written by the executor when the job finishes.
@@ -82,6 +100,9 @@ pub struct JobResult {
 pub enum JobState {
     Pending,
     Claimed,
+    /// Claimed, but the executor's lease has lapsed with no result; a node
+    /// will take it over.
+    Orphaned,
     Succeeded,
     Failed,
     Cancelled,
@@ -93,6 +114,17 @@ impl JobState {
         claim: Option<&JobClaim>,
         result: Option<&JobResult>,
     ) -> JobState {
+        JobState::derive_at(spec, claim, result, 0)
+    }
+
+    /// Like `derive`, but a claim whose lease lapsed before `now_ms` reads
+    /// as `Orphaned`. `now_ms == 0` disables the lease check.
+    pub fn derive_at(
+        spec: &JobSpec,
+        claim: Option<&JobClaim>,
+        result: Option<&JobResult>,
+        now_ms: u64,
+    ) -> JobState {
         match (result, claim) {
             (Some(r), _) => {
                 if r.exit_code == Some(0) {
@@ -102,6 +134,7 @@ impl JobState {
                 }
             }
             (None, _) if spec.cancelled => JobState::Cancelled,
+            (None, Some(c)) if now_ms > 0 && c.lease_expired_at(now_ms) => JobState::Orphaned,
             (None, Some(_)) => JobState::Claimed,
             (None, None) => JobState::Pending,
         }
@@ -170,6 +203,8 @@ mod tests {
             job_id: "j".into(),
             node: "n".into(),
             claimed_at_ms: 0,
+            lease_until_ms: 100,
+            attempt: 1,
         };
         let ok = JobResult {
             job_id: "j".into(),
@@ -209,6 +244,27 @@ mod tests {
             JobState::derive(&cancelled, Some(&claim), Some(&ok)),
             JobState::Succeeded
         );
+        assert_eq!(
+            JobState::derive_at(&spec(), Some(&claim), None, 50),
+            JobState::Claimed
+        );
+        assert_eq!(
+            JobState::derive_at(&spec(), Some(&claim), None, 101),
+            JobState::Orphaned
+        );
+        assert_eq!(
+            JobState::derive_at(&spec(), Some(&claim), Some(&ok), 101),
+            JobState::Succeeded
+        );
+    }
+
+    #[test]
+    fn legacy_claim_without_lease_deserializes() {
+        let c: JobClaim =
+            serde_json::from_str(r#"{"job_id":"j","node":"n","claimed_at_ms":5}"#).unwrap();
+        assert_eq!(c.lease_until_ms, 0);
+        assert_eq!(c.attempt, 1);
+        assert!(c.lease_expired_at(1));
     }
 
     #[test]
