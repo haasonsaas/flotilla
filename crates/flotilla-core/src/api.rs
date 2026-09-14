@@ -84,3 +84,39 @@ pub struct StatusResponse {
 pub struct ErrorBody {
     pub error: String,
 }
+
+/// Turn a peer address as advertised (`100.1.2.3`, `100.1.2.3:7401`,
+/// `fd7a::1`) into an HTTP base URL.
+pub fn base_url(addr: &str, default_port: u16) -> Option<String> {
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return Some(format!("http://{sa}"));
+    }
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => Some(format!("http://{ip}:{default_port}")),
+        Ok(std::net::IpAddr::V6(ip)) => Some(format!("http://[{ip}]:{default_port}")),
+        Err(_) => None,
+    }
+}
+
+/// Pick the best advertised address for a peer: IPv4 first.
+pub fn peer_url(ips: &[String], default_port: u16) -> Option<String> {
+    ips.iter()
+        .filter(|s| !s.contains("::"))
+        .chain(ips.iter().filter(|s| s.contains("::")))
+        .find_map(|s| base_url(s, default_port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls() {
+        assert_eq!(base_url("100.1.2.3", 7400).unwrap(), "http://100.1.2.3:7400");
+        assert_eq!(base_url("100.1.2.3:9", 7400).unwrap(), "http://100.1.2.3:9");
+        assert_eq!(base_url("fd7a::1", 7400).unwrap(), "http://[fd7a::1]:7400");
+        assert!(base_url("nope", 7400).is_none());
+        let ips = vec!["fd7a::1".to_string(), "100.1.2.3".to_string()];
+        assert_eq!(peer_url(&ips, 1).unwrap(), "http://100.1.2.3:1");
+    }
+}
