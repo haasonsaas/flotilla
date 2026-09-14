@@ -24,6 +24,10 @@ pub struct Config {
     pub reconcile_interval_secs: u64,
     /// Extra listen addresses (host:port). Loopback and Tailscale IPs are always bound.
     pub listen: Vec<String>,
+    /// Peers to sync with that may not be discoverable yet or that listen on a
+    /// non-default port, as `host:port`. Once a peer's facts are known its
+    /// advertised port is used instead.
+    pub seeds: Vec<String>,
     /// "tailscale" (default) or "static" (tests).
     pub identity: String,
     pub static_identity: Option<StaticIdentityConfig>,
@@ -69,6 +73,7 @@ impl Default for Config {
             scheduler_interval_secs: 3,
             reconcile_interval_secs: 60,
             listen: Vec::new(),
+            seeds: Vec::new(),
             identity: "tailscale".into(),
             static_identity: None,
         }
