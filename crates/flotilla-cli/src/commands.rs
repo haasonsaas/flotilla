@@ -57,6 +57,7 @@ pub async fn status(c: &Client, json: bool) -> Result<()> {
         "jobs",
         "labels",
         "facts age",
+        "synced",
     ]);
     for n in &st.nodes {
         let f = &n.facts;

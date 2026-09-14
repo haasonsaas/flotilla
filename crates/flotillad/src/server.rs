@@ -303,10 +303,17 @@ async fn post_sync_now(
 ) -> ApiResult<Json<Vec<SyncNowResult>>> {
     let all = crate::sync_loop::candidates(&state).await?;
     let selected: Vec<_> = match &req.peer {
-        Some(p) => all
-            .into_iter()
-            .filter(|c| &c.key == p || &c.name == p || &c.url == p)
-            .collect(),
+        Some(p) => {
+            let as_url = flotilla_core::api::base_url(p, state.cfg.port);
+            all.into_iter()
+                .filter(|c| {
+                    &c.key == p
+                        || &c.name == p
+                        || &c.url == p
+                        || as_url.as_deref() == Some(c.url.as_str())
+                })
+                .collect()
+        }
         None => all,
     };
     let mut out = Vec::new();
