@@ -104,7 +104,13 @@ impl Store {
 
     /// Write a value authored by this node.
     pub fn put(&self, key: &str, value: Value) -> Result<Record> {
-        let rec = Record { key: key.to_string(), value, author: self.me.clone(), hlc: self.clock.now(), deleted: false };
+        let rec = Record {
+            key: key.to_string(),
+            value,
+            author: self.me.clone(),
+            hlc: self.clock.now(),
+            deleted: false,
+        };
         self.write(&rec)?;
         Ok(rec)
     }
@@ -148,7 +154,11 @@ impl Store {
 
     /// Live records whose key starts with `prefix`, in key order.
     pub fn list(&self, prefix: &str) -> Result<Vec<Record>> {
-        Ok(self.list_raw(prefix)?.into_iter().filter(|r| !r.deleted).collect())
+        Ok(self
+            .list_raw(prefix)?
+            .into_iter()
+            .filter(|r| !r.deleted)
+            .collect())
     }
 
     pub fn list_raw(&self, prefix: &str) -> Result<Vec<Record>> {
@@ -181,10 +191,16 @@ impl Store {
                 None => true,
             };
             if applied {
-                t.insert(incoming.key.as_str(), serde_json::to_vec(incoming)?.as_slice())?;
+                t.insert(
+                    incoming.key.as_str(),
+                    serde_json::to_vec(incoming)?.as_slice(),
+                )?;
             }
             let mut vv = txn.open_table(VV)?;
-            let seen = vv.get(incoming.author.as_str())?.map(|v| v.value()).unwrap_or(0);
+            let seen = vv
+                .get(incoming.author.as_str())?
+                .map(|v| v.value())
+                .unwrap_or(0);
             if incoming.hlc.0 > seen {
                 vv.insert(incoming.author.as_str(), incoming.hlc.0)?;
             }
@@ -271,7 +287,10 @@ mod tests {
         s.put("node/x/facts", json!({})).unwrap();
         assert_eq!(s.get("job/1").unwrap().unwrap().value, json!({"n": 1}));
         let jobs = s.list("job/").unwrap();
-        assert_eq!(jobs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["job/1", "job/2"]);
+        assert_eq!(
+            jobs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            ["job/1", "job/2"]
+        );
         assert!(s.delete("job/1").unwrap().is_some());
         assert!(s.get("job/1").unwrap().is_none());
         assert!(s.get_raw("job/1").unwrap().unwrap().deleted);

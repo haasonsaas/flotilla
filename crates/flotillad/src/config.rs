@@ -76,7 +76,9 @@ impl Default for Config {
 }
 
 pub fn home() -> PathBuf {
-    directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from("/"))
+    directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -96,13 +98,17 @@ pub fn default_data_dir() -> PathBuf {
 
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Config> {
-        let path = path.map(Path::to_path_buf).unwrap_or_else(default_config_path);
+        let path = path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_config_path);
         if !path.exists() {
             tracing::info!(path = %path.display(), "no config file, using defaults");
             return Ok(Config::default());
         }
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         tracing::info!(path = %path.display(), "config loaded");
         Ok(cfg)
     }

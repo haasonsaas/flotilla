@@ -112,7 +112,10 @@ mod tests {
 
     #[test]
     fn urls() {
-        assert_eq!(base_url("100.1.2.3", 7400).unwrap(), "http://100.1.2.3:7400");
+        assert_eq!(
+            base_url("100.1.2.3", 7400).unwrap(),
+            "http://100.1.2.3:7400"
+        );
         assert_eq!(base_url("100.1.2.3:9", 7400).unwrap(), "http://100.1.2.3:9");
         assert_eq!(base_url("fd7a::1", 7400).unwrap(), "http://[fd7a::1]:7400");
         assert!(base_url("nope", 7400).is_none());

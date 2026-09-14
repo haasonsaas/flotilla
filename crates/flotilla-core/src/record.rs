@@ -36,7 +36,13 @@ mod tests {
     use super::*;
 
     fn rec(author: &str, hlc: u64) -> Record {
-        Record { key: "k".into(), value: Value::Null, author: author.into(), hlc: Hlc(hlc), deleted: false }
+        Record {
+            key: "k".into(),
+            value: Value::Null,
+            author: author.into(),
+            hlc: Hlc(hlc),
+            deleted: false,
+        }
     }
 
     #[test]

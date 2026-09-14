@@ -27,15 +27,26 @@ pub async fn require_peer(
 ) -> Response {
     let ip = addr.ip();
     let caller = if ip.is_loopback() {
-        Caller { node_id: state.me.node_id.clone(), name: "local".into(), login: "local".into() }
+        Caller {
+            node_id: state.me.node_id.clone(),
+            name: "local".into(),
+            login: "local".into(),
+        }
     } else {
         match state.identity.whois(ip).await {
             Ok(Some(w)) => {
                 if !is_allowed(&state.cfg, &w) {
                     tracing::warn!(%ip, login = %w.login, tags = ?w.tags, "rejected: not allowed");
-                    return reject(StatusCode::FORBIDDEN, format!("{} is not an allowed user or tag", w.login));
+                    return reject(
+                        StatusCode::FORBIDDEN,
+                        format!("{} is not an allowed user or tag", w.login),
+                    );
                 }
-                Caller { node_id: w.node_id, name: w.name, login: w.login }
+                Caller {
+                    node_id: w.node_id,
+                    name: w.name,
+                    login: w.login,
+                }
             }
             Ok(None) => {
                 tracing::warn!(%ip, "rejected: unknown peer");
@@ -43,7 +54,10 @@ pub async fn require_peer(
             }
             Err(e) => {
                 tracing::error!(%ip, error = %e, "identity lookup failed");
-                return reject(StatusCode::SERVICE_UNAVAILABLE, "identity lookup failed".into());
+                return reject(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "identity lookup failed".into(),
+                );
             }
         }
     };
@@ -68,15 +82,33 @@ mod tests {
     use crate::identity::WhoIs;
 
     fn who(login: &str, tags: &[&str]) -> WhoIs {
-        WhoIs { node_id: "n".into(), name: "n".into(), login: login.into(), tags: tags.iter().map(|s| s.to_string()).collect() }
+        WhoIs {
+            node_id: "n".into(),
+            name: "n".into(),
+            login: login.into(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]
     fn policy() {
-        let cfg = Config { allowed_users: vec!["me@example.com".into()], allowed_tags: vec!["tag:fleet".into()], ..Config::default() };
+        let cfg = Config {
+            allowed_users: vec!["me@example.com".into()],
+            allowed_tags: vec!["tag:fleet".into()],
+            ..Config::default()
+        };
         assert!(is_allowed(&cfg, &who("me@example.com", &[])));
-        assert!(is_allowed(&cfg, &who("tagged-devices", &["tag:other", "tag:fleet"])));
-        assert!(!is_allowed(&cfg, &who("stranger@example.com", &["tag:other"])));
-        assert!(!is_allowed(&Config::default(), &who("me@example.com", &[])), "empty policy denies");
+        assert!(is_allowed(
+            &cfg,
+            &who("tagged-devices", &["tag:other", "tag:fleet"])
+        ));
+        assert!(!is_allowed(
+            &cfg,
+            &who("stranger@example.com", &["tag:other"])
+        ));
+        assert!(
+            !is_allowed(&Config::default(), &who("me@example.com", &[])),
+            "empty policy denies"
+        );
     }
 }

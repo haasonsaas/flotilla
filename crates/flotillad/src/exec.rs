@@ -22,12 +22,20 @@ pub fn spawn(req: ExecRequest, cancel: CancellationToken) -> mpsc::Receiver<Exec
 
 async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecFrame>) {
     if req.cmd.is_empty() {
-        let _ = tx.send(ExecFrame::Error { message: "empty command".into() }).await;
+        let _ = tx
+            .send(ExecFrame::Error {
+                message: "empty command".into(),
+            })
+            .await;
         let _ = tx.send(ExecFrame::Exit { code: None }).await;
         return;
     }
     let mut cmd = Command::new(&req.cmd[0]);
-    cmd.args(&req.cmd[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.args(&req.cmd[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(expand_home(cwd));
     }
@@ -37,7 +45,11 @@ async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecF
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(ExecFrame::Error { message: format!("spawn {:?}: {e}", req.cmd[0]) }).await;
+            let _ = tx
+                .send(ExecFrame::Error {
+                    message: format!("spawn {:?}: {e}", req.cmd[0]),
+                })
+                .await;
             let _ = tx.send(ExecFrame::Exit { code: None }).await;
             return;
         }
@@ -62,13 +74,25 @@ async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecF
     let code = match status {
         Some(Ok(st)) => st.code(),
         Some(Err(e)) => {
-            let _ = tx.send(ExecFrame::Error { message: format!("wait: {e}") }).await;
+            let _ = tx
+                .send(ExecFrame::Error {
+                    message: format!("wait: {e}"),
+                })
+                .await;
             None
         }
         None => {
             let _ = child.kill().await;
-            let why = if cancel.is_cancelled() { "cancelled" } else { "timed out" };
-            let _ = tx.send(ExecFrame::Error { message: why.into() }).await;
+            let why = if cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "timed out"
+            };
+            let _ = tx
+                .send(ExecFrame::Error {
+                    message: why.into(),
+                })
+                .await;
             None
         }
     };
@@ -76,7 +100,11 @@ async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecF
     let _ = tx.send(ExecFrame::Exit { code }).await;
 }
 
-async fn pump<R: tokio::io::AsyncRead + Unpin>(reader: R, tx: mpsc::Sender<ExecFrame>, mk: impl Fn(String) -> ExecFrame) {
+async fn pump<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    tx: mpsc::Sender<ExecFrame>,
+    mk: impl Fn(String) -> ExecFrame,
+) {
     let mut lines = BufReader::new(reader);
     let mut buf = Vec::with_capacity(4096);
     loop {
@@ -85,7 +113,11 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(reader: R, tx: mpsc::Sender<ExecF
         match lines.read_until(b'\n', &mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(_) => {
-                if tx.send(mk(String::from_utf8_lossy(&buf).into_owned())).await.is_err() {
+                if tx
+                    .send(mk(String::from_utf8_lossy(&buf).into_owned()))
+                    .await
+                    .is_err()
+                {
                     // consumer went away; drain to avoid blocking the child
                     let mut sink = Vec::new();
                     let _ = lines.read_to_end(&mut sink).await;
@@ -98,7 +130,10 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(reader: R, tx: mpsc::Sender<ExecF
 
 pub fn expand_home(p: &str) -> String {
     if let Some(rest) = p.strip_prefix("~/") {
-        return crate::config::home().join(rest).to_string_lossy().into_owned();
+        return crate::config::home()
+            .join(rest)
+            .to_string_lossy()
+            .into_owned();
     }
     if p == "~" {
         return crate::config::home().to_string_lossy().into_owned();
@@ -114,13 +149,21 @@ pub struct Tail {
 
 impl Tail {
     pub fn new(max: usize) -> Tail {
-        Tail { buf: String::new(), max }
+        Tail {
+            buf: String::new(),
+            max,
+        }
     }
     pub fn push(&mut self, s: &str) {
         self.buf.push_str(s);
         if self.buf.len() > self.max {
             let cut = self.buf.len() - self.max;
-            let cut = self.buf.char_indices().map(|(i, _)| i).find(|&i| i >= cut).unwrap_or(cut);
+            let cut = self
+                .buf
+                .char_indices()
+                .map(|(i, _)| i)
+                .find(|&i| i >= cut)
+                .unwrap_or(cut);
             self.buf.drain(..cut);
         }
     }
@@ -150,18 +193,30 @@ mod tests {
     #[tokio::test]
     async fn streams_stdout_stderr_and_exit() {
         let frames = collect(ExecRequest {
-            cmd: vec!["sh".into(), "-c".into(), "echo out; echo err 1>&2; exit 3".into()],
+            cmd: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo out; echo err 1>&2; exit 3".into(),
+            ],
             ..Default::default()
         })
         .await;
-        assert!(frames.contains(&ExecFrame::Stdout { data: "out\n".into() }));
-        assert!(frames.contains(&ExecFrame::Stderr { data: "err\n".into() }));
+        assert!(frames.contains(&ExecFrame::Stdout {
+            data: "out\n".into()
+        }));
+        assert!(frames.contains(&ExecFrame::Stderr {
+            data: "err\n".into()
+        }));
         assert_eq!(frames.last(), Some(&ExecFrame::Exit { code: Some(3) }));
     }
 
     #[tokio::test]
     async fn missing_binary_reports_error() {
-        let frames = collect(ExecRequest { cmd: vec!["/definitely/not/here".into()], ..Default::default() }).await;
+        let frames = collect(ExecRequest {
+            cmd: vec!["/definitely/not/here".into()],
+            ..Default::default()
+        })
+        .await;
         assert!(matches!(frames[0], ExecFrame::Error { .. }));
         assert_eq!(frames.last(), Some(&ExecFrame::Exit { code: None }));
     }
@@ -169,22 +224,37 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_child() {
         let start = std::time::Instant::now();
-        let frames = collect(ExecRequest { cmd: block_forever(), timeout_secs: Some(1), ..Default::default() }).await;
+        let frames = collect(ExecRequest {
+            cmd: block_forever(),
+            timeout_secs: Some(1),
+            ..Default::default()
+        })
+        .await;
         assert!(start.elapsed() < Duration::from_secs(10));
-        assert!(frames.iter().any(|f| matches!(f, ExecFrame::Error { message } if message == "timed out")));
+        assert!(frames
+            .iter()
+            .any(|f| matches!(f, ExecFrame::Error { message } if message == "timed out")));
         assert_eq!(frames.last(), Some(&ExecFrame::Exit { code: None }));
     }
 
     #[tokio::test]
     async fn cancel_kills_child() {
         let cancel = CancellationToken::new();
-        let mut rx = spawn(ExecRequest { cmd: block_forever(), ..Default::default() }, cancel.clone());
+        let mut rx = spawn(
+            ExecRequest {
+                cmd: block_forever(),
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
         cancel.cancel();
         let mut frames = Vec::new();
         while let Some(f) = rx.recv().await {
             frames.push(f);
         }
-        assert!(frames.iter().any(|f| matches!(f, ExecFrame::Error { message } if message == "cancelled")));
+        assert!(frames
+            .iter()
+            .any(|f| matches!(f, ExecFrame::Error { message } if message == "cancelled")));
     }
 
     #[tokio::test]
@@ -192,12 +262,16 @@ mod tests {
         let frames = collect(ExecRequest {
             cmd: vec!["sh".into(), "-c".into(), "pwd; echo $FLOT".into()],
             cwd: Some("/".into()),
-            env: [("FLOT".to_string(), "yes".to_string())].into_iter().collect(),
+            env: [("FLOT".to_string(), "yes".to_string())]
+                .into_iter()
+                .collect(),
             ..Default::default()
         })
         .await;
         assert!(frames.contains(&ExecFrame::Stdout { data: "/\n".into() }));
-        assert!(frames.contains(&ExecFrame::Stdout { data: "yes\n".into() }));
+        assert!(frames.contains(&ExecFrame::Stdout {
+            data: "yes\n".into()
+        }));
     }
 
     #[test]

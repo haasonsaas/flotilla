@@ -23,7 +23,9 @@ pub async fn run(state: AppState) {
 }
 
 async fn tick(state: &AppState) -> anyhow::Result<()> {
-    let Some(facts) = state.my_facts() else { return Ok(()) };
+    let Some(facts) = state.my_facts() else {
+        return Ok(());
+    };
     for rec in state.store.list(keys::JOB)? {
         let spec: JobSpec = match rec.parse() {
             Ok(s) => s,
@@ -45,7 +47,12 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         if !eligible {
             continue;
         }
-        match state.store.get(&keys::claim(&spec.id))?.map(|r| r.parse::<JobClaim>()).transpose()? {
+        match state
+            .store
+            .get(&keys::claim(&spec.id))?
+            .map(|r| r.parse::<JobClaim>())
+            .transpose()?
+        {
             Some(claim) if claim.node == state.me.node_id => {
                 // Ours (e.g. after a restart) but not running: run it now.
                 start(state.clone(), spec, false);
@@ -55,7 +62,11 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
                 if state.running.lock().unwrap().len() >= state.cfg.max_concurrent_jobs {
                     continue;
                 }
-                let claim = JobClaim { job_id: spec.id.clone(), node: state.me.node_id.clone(), claimed_at_ms: flotilla_core::now_ms() };
+                let claim = JobClaim {
+                    job_id: spec.id.clone(),
+                    node: state.me.node_id.clone(),
+                    claimed_at_ms: flotilla_core::now_ms(),
+                };
                 state.store.put_json(&keys::claim(&spec.id), &claim)?;
                 tracing::info!(job = %spec.id, "claimed, settling");
                 start(state.clone(), spec, true);
@@ -67,12 +78,21 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
 
 fn start(state: AppState, spec: JobSpec, settle: bool) {
     let cancel = CancellationToken::new();
-    state.running.lock().unwrap().insert(spec.id.clone(), cancel.clone());
+    state
+        .running
+        .lock()
+        .unwrap()
+        .insert(spec.id.clone(), cancel.clone());
     tokio::spawn(async move {
         let id = spec.id.clone();
         if settle {
             pause(state.cfg.settle_window()).await;
-            let winner = state.store.get(&keys::claim(&id)).ok().flatten().and_then(|r| r.parse::<JobClaim>().ok());
+            let winner = state
+                .store
+                .get(&keys::claim(&id))
+                .ok()
+                .flatten()
+                .and_then(|r| r.parse::<JobClaim>().ok());
             match winner {
                 Some(c) if c.node == state.me.node_id => {}
                 other => {
@@ -83,7 +103,14 @@ fn start(state: AppState, spec: JobSpec, settle: bool) {
             }
         }
         // A cancel may have landed during settling.
-        let cancelled_now = state.store.get(&keys::job(&id)).ok().flatten().and_then(|r| r.parse::<JobSpec>().ok()).map(|s| s.cancelled).unwrap_or(true);
+        let cancelled_now = state
+            .store
+            .get(&keys::job(&id))
+            .ok()
+            .flatten()
+            .and_then(|r| r.parse::<JobSpec>().ok())
+            .map(|s| s.cancelled)
+            .unwrap_or(true);
         if cancelled_now {
             state.running.lock().unwrap().remove(&id);
             return;
@@ -100,10 +127,17 @@ fn start(state: AppState, spec: JobSpec, settle: bool) {
 
 async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) -> JobResult {
     let started = flotilla_core::now_ms();
-    let req = ExecRequest { cmd: spec.cmd.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), timeout_secs: spec.timeout_secs };
+    let req = ExecRequest {
+        cmd: spec.cmd.clone(),
+        cwd: spec.cwd.clone(),
+        env: spec.env.clone(),
+        timeout_secs: spec.timeout_secs,
+    };
     let mut rx = exec::spawn(req, cancel.clone());
     let mut tail = Tail::new(TAIL_BYTES);
-    let mut log = tokio::fs::File::create(state.cfg.job_log_path(&spec.id)).await.ok();
+    let mut log = tokio::fs::File::create(state.cfg.job_log_path(&spec.id))
+        .await
+        .ok();
     let mut exit = None;
     let mut error = None;
 
@@ -115,7 +149,14 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
         tokio::spawn(async move {
             loop {
                 pause(Duration::from_secs(1)).await;
-                let cancelled = state.store.get(&keys::job(&id)).ok().flatten().and_then(|r| r.parse::<JobSpec>().ok()).map(|s| s.cancelled).unwrap_or(false);
+                let cancelled = state
+                    .store
+                    .get(&keys::job(&id))
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.parse::<JobSpec>().ok())
+                    .map(|s| s.cancelled)
+                    .unwrap_or(false);
                 if cancelled {
                     cancel.cancel();
                     return;

@@ -17,7 +17,10 @@ pub async fn run(state: AppState) {
         .await
         {
             Ok(facts) => {
-                if let Err(e) = state.store.put_json(&keys::node_facts(&state.me.node_id), &facts) {
+                if let Err(e) = state
+                    .store
+                    .put_json(&keys::node_facts(&state.me.node_id), &facts)
+                {
                     tracing::error!(error = %e, "writing facts");
                 }
             }
@@ -28,9 +31,13 @@ pub async fn run(state: AppState) {
 }
 
 pub fn collect(state: &AppState) -> NodeFacts {
-    let sys = System::new_with_specifics(RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()));
+    let sys = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
     let disks = Disks::new_with_refreshed_list();
-    let root = disks.iter().find(|d| d.mount_point() == std::path::Path::new("/"));
+    let root = disks
+        .iter()
+        .find(|d| d.mount_point() == std::path::Path::new("/"));
     let (bat, ac) = battery();
     let mut labels = Labels::new();
     labels.insert("os".into(), std::env::consts::OS.into());
@@ -50,12 +57,16 @@ pub fn collect(state: &AppState) -> NodeFacts {
         },
         arch: std::env::consts::ARCH.into(),
         version: crate::VERSION.into(),
-        cpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        cpus: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
         load_1m: System::load_average().one,
         mem_total_mb: sys.total_memory() / (1024 * 1024),
         mem_free_mb: sys.available_memory() / (1024 * 1024),
         disk_total_gb: root.map(|d| d.total_space() / 1_000_000_000).unwrap_or(0),
-        disk_free_gb: root.map(|d| d.available_space() / 1_000_000_000).unwrap_or(0),
+        disk_free_gb: root
+            .map(|d| d.available_space() / 1_000_000_000)
+            .unwrap_or(0),
         uptime_secs: System::uptime(),
         battery_pct: bat,
         on_ac: ac,
@@ -69,7 +80,10 @@ pub fn collect(state: &AppState) -> NodeFacts {
 
 #[cfg(target_os = "macos")]
 fn battery() -> (Option<u8>, Option<bool>) {
-    let out = match std::process::Command::new("pmset").args(["-g", "batt"]).output() {
+    let out = match std::process::Command::new("pmset")
+        .args(["-g", "batt"])
+        .output()
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => return (None, None),
     };
@@ -87,7 +101,11 @@ fn parse_pmset(out: &str) -> (Option<u8>, Option<bool>) {
     };
     let pct = out.lines().find_map(|l| {
         let (before, _) = l.split_once('%')?;
-        before.rsplit(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+        before
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
     });
     (pct, ac)
 }
@@ -101,9 +119,13 @@ fn battery() -> (Option<u8>, Option<bool>) {
             let p = e.path();
             let ty = std::fs::read_to_string(p.join("type")).unwrap_or_default();
             if ty.trim() == "Battery" {
-                pct = std::fs::read_to_string(p.join("capacity")).ok().and_then(|s| s.trim().parse().ok());
+                pct = std::fs::read_to_string(p.join("capacity"))
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok());
             } else if ty.trim() == "Mains" {
-                ac = std::fs::read_to_string(p.join("online")).ok().map(|s| s.trim() == "1");
+                ac = std::fs::read_to_string(p.join("online"))
+                    .ok()
+                    .map(|s| s.trim() == "1");
             }
         }
     }
@@ -125,6 +147,9 @@ mod tests {
         assert_eq!(parse_pmset(s), (Some(87), Some(true)));
         let s = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t100%; discharging; (no estimate) present: true\n";
         assert_eq!(parse_pmset(s), (Some(100), Some(false)));
-        assert_eq!(parse_pmset("Now drawing from 'AC Power'\n"), (None, Some(true)));
+        assert_eq!(
+            parse_pmset("Now drawing from 'AC Power'\n"),
+            (None, Some(true))
+        );
     }
 }

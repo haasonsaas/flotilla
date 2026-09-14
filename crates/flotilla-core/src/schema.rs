@@ -88,7 +88,11 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub fn derive(spec: &JobSpec, claim: Option<&JobClaim>, result: Option<&JobResult>) -> JobState {
+    pub fn derive(
+        spec: &JobSpec,
+        claim: Option<&JobClaim>,
+        result: Option<&JobResult>,
+    ) -> JobState {
         match (result, claim) {
             (Some(r), _) => {
                 if r.exit_code == Some(0) {
@@ -162,7 +166,11 @@ mod tests {
 
     #[test]
     fn job_state_derivation() {
-        let claim = JobClaim { job_id: "j".into(), node: "n".into(), claimed_at_ms: 0 };
+        let claim = JobClaim {
+            job_id: "j".into(),
+            node: "n".into(),
+            claimed_at_ms: 0,
+        };
         let ok = JobResult {
             job_id: "j".into(),
             node: "n".into(),
@@ -172,19 +180,45 @@ mod tests {
             output_tail: String::new(),
             error: None,
         };
-        let bad = JobResult { exit_code: Some(1), ..ok.clone() };
+        let bad = JobResult {
+            exit_code: Some(1),
+            ..ok.clone()
+        };
         assert_eq!(JobState::derive(&spec(), None, None), JobState::Pending);
-        assert_eq!(JobState::derive(&spec(), Some(&claim), None), JobState::Claimed);
-        assert_eq!(JobState::derive(&spec(), Some(&claim), Some(&ok)), JobState::Succeeded);
-        assert_eq!(JobState::derive(&spec(), Some(&claim), Some(&bad)), JobState::Failed);
-        let cancelled = JobSpec { cancelled: true, ..spec() };
-        assert_eq!(JobState::derive(&cancelled, Some(&claim), None), JobState::Cancelled);
-        assert_eq!(JobState::derive(&cancelled, Some(&claim), Some(&ok)), JobState::Succeeded);
+        assert_eq!(
+            JobState::derive(&spec(), Some(&claim), None),
+            JobState::Claimed
+        );
+        assert_eq!(
+            JobState::derive(&spec(), Some(&claim), Some(&ok)),
+            JobState::Succeeded
+        );
+        assert_eq!(
+            JobState::derive(&spec(), Some(&claim), Some(&bad)),
+            JobState::Failed
+        );
+        let cancelled = JobSpec {
+            cancelled: true,
+            ..spec()
+        };
+        assert_eq!(
+            JobState::derive(&cancelled, Some(&claim), None),
+            JobState::Cancelled
+        );
+        assert_eq!(
+            JobState::derive(&cancelled, Some(&claim), Some(&ok)),
+            JobState::Succeeded
+        );
     }
 
     #[test]
     fn facts_round_trip_json() {
-        let f = NodeFacts { node_id: "x".into(), name: "x".into(), cpus: 8, ..Default::default() };
+        let f = NodeFacts {
+            node_id: "x".into(),
+            name: "x".into(),
+            cpus: 8,
+            ..Default::default()
+        };
         let back: NodeFacts = serde_json::from_value(serde_json::to_value(&f).unwrap()).unwrap();
         assert_eq!(back, f);
     }

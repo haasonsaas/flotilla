@@ -23,12 +23,18 @@ pub struct SyncMessage {
 /// requester is missing.
 pub fn respond(store: &Store, incoming: &SyncMessage) -> Result<SyncMessage> {
     store.merge_all(&incoming.records)?;
-    Ok(SyncMessage { vv: store.version_vector()?, records: store.delta_since(&incoming.vv)? })
+    Ok(SyncMessage {
+        vv: store.version_vector()?,
+        records: store.delta_since(&incoming.vv)?,
+    })
 }
 
 /// Requester side, step 1: what to send first.
 pub fn open(store: &Store) -> Result<SyncMessage> {
-    Ok(SyncMessage { vv: store.version_vector()?, records: Vec::new() })
+    Ok(SyncMessage {
+        vv: store.version_vector()?,
+        records: Vec::new(),
+    })
 }
 
 /// Requester side, step 2: merge the reply and build the push (may be empty).
@@ -36,7 +42,13 @@ pub fn open(store: &Store) -> Result<SyncMessage> {
 pub fn close(store: &Store, reply: &SyncMessage) -> Result<(usize, SyncMessage)> {
     let applied = store.merge_all(&reply.records)?;
     let push = store.delta_since(&reply.vv)?;
-    Ok((applied, SyncMessage { vv: store.version_vector()?, records: push }))
+    Ok((
+        applied,
+        SyncMessage {
+            vv: store.version_vector()?,
+            records: push,
+        },
+    ))
 }
 
 /// Run a full in-process sync between two stores. Used by tests.
@@ -60,8 +72,7 @@ mod tests {
     use std::sync::Arc;
 
     fn contents(s: &Store) -> Vec<Record> {
-        s.list_raw("")
-            .unwrap()
+        s.list_raw("").unwrap()
     }
 
     #[test]
@@ -126,7 +137,10 @@ mod tests {
     fn random_ops_random_sync_order_converge() {
         let mut rng = StdRng::seed_from_u64(42);
         let ids = ["n1", "n2", "n3", "n4"];
-        let stores: Vec<Store> = ids.iter().map(|id| Store::in_memory(*id).unwrap()).collect();
+        let stores: Vec<Store> = ids
+            .iter()
+            .map(|id| Store::in_memory(*id).unwrap())
+            .collect();
         for round in 0..30 {
             for (i, s) in stores.iter().enumerate() {
                 for _ in 0..rng.random_range(0..4) {

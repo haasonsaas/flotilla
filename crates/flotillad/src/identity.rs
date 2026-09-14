@@ -37,9 +37,14 @@ pub enum IdentityProvider {
 impl IdentityProvider {
     pub fn from_config(cfg: &Config) -> Result<IdentityProvider> {
         match cfg.identity.as_str() {
-            "tailscale" => Ok(IdentityProvider::Tailscale(Tailscale::new(cfg.tailscale_bin.clone())?)),
+            "tailscale" => Ok(IdentityProvider::Tailscale(Tailscale::new(
+                cfg.tailscale_bin.clone(),
+            )?)),
             "static" => {
-                let sc = cfg.static_identity.clone().ok_or_else(|| anyhow!("identity=static needs [static_identity]"))?;
+                let sc = cfg
+                    .static_identity
+                    .clone()
+                    .ok_or_else(|| anyhow!("identity=static needs [static_identity]"))?;
                 Ok(IdentityProvider::Static(StaticIdentity::new(sc)?))
             }
             other => bail!("unknown identity provider {other:?}"),
@@ -99,17 +104,31 @@ impl Tailscale {
     pub fn new(bin: Option<PathBuf>) -> Result<Tailscale> {
         let bin = match bin {
             Some(b) => b,
-            None => find_tailscale().ok_or_else(|| anyhow!("tailscale CLI not found; set tailscale_bin in config"))?,
+            None => find_tailscale()
+                .ok_or_else(|| anyhow!("tailscale CLI not found; set tailscale_bin in config"))?,
         };
-        Ok(Tailscale { bin, status_cache: Mutex::new(None), whois_cache: Mutex::new(HashMap::new()) })
+        Ok(Tailscale {
+            bin,
+            status_cache: Mutex::new(None),
+            whois_cache: Mutex::new(HashMap::new()),
+        })
     }
 
     async fn run(&self, args: &[&str]) -> Result<Value> {
-        let out = Command::new(&self.bin).args(args).output().await.with_context(|| format!("running {}", self.bin.display()))?;
+        let out = Command::new(&self.bin)
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("running {}", self.bin.display()))?;
         if !out.status.success() {
-            bail!("tailscale {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+            bail!(
+                "tailscale {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
-        serde_json::from_slice(&out.stdout).with_context(|| format!("parsing tailscale {:?} output", args))
+        serde_json::from_slice(&out.stdout)
+            .with_context(|| format!("parsing tailscale {:?} output", args))
     }
 
     async fn status(&self) -> Result<Value> {
@@ -125,12 +144,22 @@ impl Tailscale {
 
     pub async fn me(&self) -> Result<NodeInfo> {
         let st = self.status().await?;
-        let s = st.get("Self").ok_or_else(|| anyhow!("tailscale status has no Self"))?;
+        let s = st
+            .get("Self")
+            .ok_or_else(|| anyhow!("tailscale status has no Self"))?;
         Ok(NodeInfo {
             node_id: str_field(s, "ID")?,
             name: short_name(&str_field(s, "DNSName")?),
-            hostname: s.get("HostName").and_then(Value::as_str).unwrap_or("").to_string(),
-            os: s.get("OS").and_then(Value::as_str).unwrap_or("").to_string(),
+            hostname: s
+                .get("HostName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            os: s
+                .get("OS")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             ips: ips_of(s),
         })
     }
@@ -145,11 +174,20 @@ impl Tailscale {
                     name: short_name(p.get("DNSName").and_then(Value::as_str).unwrap_or("")),
                     online: p.get("Online").and_then(Value::as_bool).unwrap_or(false),
                     ips: ips_of(p).iter().map(ToString::to_string).collect(),
-                    os: p.get("OS").and_then(Value::as_str).unwrap_or("").to_string(),
+                    os: p
+                        .get("OS")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     tags: p
                         .get("Tags")
                         .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(String::from)
+                                .collect()
+                        })
                         .unwrap_or_default(),
                 });
             }
@@ -169,7 +207,11 @@ impl Tailscale {
             Ok(v) => {
                 let node = v.get("Node").ok_or_else(|| anyhow!("whois has no Node"))?;
                 Some(WhoIs {
-                    node_id: node.get("StableID").and_then(Value::as_str).unwrap_or("").to_string(),
+                    node_id: node
+                        .get("StableID")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     name: short_name(node.get("Name").and_then(Value::as_str).unwrap_or("")),
                     login: v
                         .pointer("/UserProfile/LoginName")
@@ -179,7 +221,12 @@ impl Tailscale {
                     tags: node
                         .get("Tags")
                         .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(String::from)
+                                .collect()
+                        })
                         .unwrap_or_default(),
                 })
             }
@@ -188,19 +235,30 @@ impl Tailscale {
                 None
             }
         };
-        self.whois_cache.lock().unwrap().insert(ip, (Instant::now(), result.clone()));
+        self.whois_cache
+            .lock()
+            .unwrap()
+            .insert(ip, (Instant::now(), result.clone()));
         Ok(result)
     }
 }
 
 fn str_field(v: &Value, k: &str) -> Result<String> {
-    v.get(k).and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("missing {k}"))
+    v.get(k)
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| anyhow!("missing {k}"))
 }
 
 fn ips_of(v: &Value) -> Vec<IpAddr> {
     v.get("TailscaleIPs")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).filter_map(|s| s.parse().ok()).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -229,7 +287,9 @@ fn find_tailscale() -> Option<PathBuf> {
 
 fn which(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).map(|d| d.join(name)).find(|p| p.is_file())
+        std::env::split_paths(&paths)
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
     })
 }
 
@@ -253,33 +313,63 @@ impl StaticIdentity {
         };
         let mut by_ip = HashMap::new();
         for ip in &me.ips {
-            by_ip.insert(*ip, WhoIs { node_id: me.node_id.clone(), name: me.name.clone(), login: sc.login.clone(), tags: vec![] });
+            by_ip.insert(
+                *ip,
+                WhoIs {
+                    node_id: me.node_id.clone(),
+                    name: me.name.clone(),
+                    login: sc.login.clone(),
+                    tags: vec![],
+                },
+            );
         }
         let mut peers = Vec::new();
         for p in &sc.peers {
             for ip in &p.ips {
                 let ip: IpAddr = ip.parse()?;
-                by_ip.insert(ip, WhoIs { node_id: p.node_id.clone(), name: p.name.clone(), login: sc.login.clone(), tags: vec![] });
+                by_ip.insert(
+                    ip,
+                    WhoIs {
+                        node_id: p.node_id.clone(),
+                        name: p.name.clone(),
+                        login: sc.login.clone(),
+                        tags: vec![],
+                    },
+                );
             }
             peers.push(PeerInfo {
                 node_id: p.node_id.clone(),
                 name: p.name.clone(),
                 online: true,
-                ips: p.ips.iter().map(|ip| match p.port {
-                    Some(port) => format!("{ip}:{port}"),
-                    None => ip.clone(),
-                }).collect(),
+                ips: p
+                    .ips
+                    .iter()
+                    .map(|ip| match p.port {
+                        Some(port) => format!("{ip}:{port}"),
+                        None => ip.clone(),
+                    })
+                    .collect(),
                 os: std::env::consts::OS.to_string(),
                 tags: vec![],
             });
         }
-        Ok(StaticIdentity { me, peers, login: sc.login, by_ip })
+        Ok(StaticIdentity {
+            me,
+            peers,
+            login: sc.login,
+            by_ip,
+        })
     }
 
     fn whois(&self, ip: IpAddr) -> Option<WhoIs> {
         self.by_ip.get(&ip).cloned().or_else(|| {
             if ip.is_loopback() {
-                Some(WhoIs { node_id: "loopback".into(), name: "loopback".into(), login: self.login.clone(), tags: vec![] })
+                Some(WhoIs {
+                    node_id: "loopback".into(),
+                    name: "loopback".into(),
+                    login: self.login.clone(),
+                    tags: vec![],
+                })
             } else {
                 None
             }
@@ -293,7 +383,10 @@ mod tests {
 
     #[test]
     fn short_names() {
-        assert_eq!(short_name("jonathan-air.angler-centauri.ts.net."), "jonathan-air");
+        assert_eq!(
+            short_name("jonathan-air.angler-centauri.ts.net."),
+            "jonathan-air"
+        );
         assert_eq!(short_name("plain"), "plain");
     }
 
@@ -305,7 +398,11 @@ mod tests {
             "Peer": {"k": {"ID": "p1", "DNSName": "peer.x.ts.net.", "OS": "linux", "Online": true,
                             "TailscaleIPs": ["100.2.2.2"], "Tags": ["tag:a"]}}
         });
-        let ts = Tailscale { bin: PathBuf::from("/bin/false"), status_cache: Mutex::new(Some((Instant::now(), v))), whois_cache: Mutex::new(HashMap::new()) };
+        let ts = Tailscale {
+            bin: PathBuf::from("/bin/false"),
+            status_cache: Mutex::new(Some((Instant::now(), v))),
+            whois_cache: Mutex::new(HashMap::new()),
+        };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let me = rt.block_on(ts.me()).unwrap();
         assert_eq!(me.node_id, "abc");

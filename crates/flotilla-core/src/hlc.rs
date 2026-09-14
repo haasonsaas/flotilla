@@ -64,7 +64,10 @@ impl Clock {
     }
 
     pub fn with_wall(wall: impl Fn() -> u64 + Send + Sync + 'static) -> Clock {
-        Clock { last: Mutex::new(Hlc::ZERO), wall: Box::new(wall) }
+        Clock {
+            last: Mutex::new(Hlc::ZERO),
+            wall: Box::new(wall),
+        }
     }
 
     /// Issue a new timestamp greater than every timestamp issued or

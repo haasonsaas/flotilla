@@ -37,7 +37,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .init();
 
@@ -49,7 +51,8 @@ async fn main() -> Result<()> {
     if let Some(p) = args.port {
         cfg.port = p;
     }
-    std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
+    std::fs::create_dir_all(&cfg.data_dir)
+        .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
     std::fs::create_dir_all(cfg.jobs_dir())?;
 
     let identity = Arc::new(identity::IdentityProvider::from_config(&cfg)?);
@@ -62,7 +65,10 @@ async fn main() -> Result<()> {
     }
     let cfg = Arc::new(cfg);
 
-    let store = Arc::new(flotilla_core::Store::open(&cfg.data_dir.join("store.redb"), me.node_id.clone())?);
+    let store = Arc::new(flotilla_core::Store::open(
+        &cfg.data_dir.join("store.redb"),
+        me.node_id.clone(),
+    )?);
     tracing::info!(node = %me.name, id = %me.node_id, records = store.len()?, "store opened");
 
     let state = server::AppState::new(cfg.clone(), identity.clone(), store.clone(), me.clone());

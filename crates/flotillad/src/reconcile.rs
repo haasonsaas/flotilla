@@ -17,11 +17,22 @@ pub async fn run(state: AppState) {
 }
 
 async fn pass(state: &AppState) -> anyhow::Result<()> {
-    let Some(rec) = state.store.get(&keys::desired(&state.me.node_id))?.or(state.store.get(&keys::desired(&state.me.name))?) else {
+    let Some(rec) = state
+        .store
+        .get(&keys::desired(&state.me.node_id))?
+        .or(state.store.get(&keys::desired(&state.me.name))?)
+    else {
         return Ok(());
     };
     let desired: DesiredState = rec.parse()?;
-    let mut report = ReconcileReport { node: state.me.node_id.clone(), at_ms: flotilla_core::now_ms(), desired_hlc: Some(rec.hlc), converged: true, changes: vec![], errors: vec![] };
+    let mut report = ReconcileReport {
+        node: state.me.node_id.clone(),
+        at_ms: flotilla_core::now_ms(),
+        desired_hlc: Some(rec.hlc),
+        converged: true,
+        changes: vec![],
+        errors: vec![],
+    };
 
     for f in &desired.files {
         let path = expand_home(&f.path);
@@ -41,7 +52,9 @@ async fn pass(state: &AppState) -> anyhow::Result<()> {
             if let Ok(bits) = u32::from_str_radix(mode.trim_start_matches("0o"), 8) {
                 if let Ok(meta) = std::fs::metadata(&path) {
                     if meta.permissions().mode() & 0o7777 != bits {
-                        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(bits)) {
+                        if let Err(e) =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(bits))
+                        {
                             report.errors.push(format!("chmod {path}: {e}"));
                         } else {
                             report.changes.push(format!("chmod {mode} {path}"));
@@ -62,13 +75,17 @@ async fn pass(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         if e.apply.is_empty() {
-            report.errors.push(format!("{}: check failed and no apply", e.name));
+            report
+                .errors
+                .push(format!("{}: check failed and no apply", e.name));
             continue;
         }
         if run_quiet(&e.apply).await && run_quiet(&e.check).await {
             report.changes.push(format!("applied {}", e.name));
         } else {
-            report.errors.push(format!("{}: apply did not satisfy check", e.name));
+            report
+                .errors
+                .push(format!("{}: apply did not satisfy check", e.name));
         }
     }
 
@@ -76,7 +93,9 @@ async fn pass(state: &AppState) -> anyhow::Result<()> {
     if !report.changes.is_empty() || !report.errors.is_empty() {
         tracing::info!(changes = ?report.changes, errors = ?report.errors, "reconciled");
     }
-    state.store.put_json(&keys::reconcile(&state.me.node_id), &report)?;
+    state
+        .store
+        .put_json(&keys::reconcile(&state.me.node_id), &report)?;
     Ok(())
 }
 
