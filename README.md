@@ -73,6 +73,26 @@ role = "builder"
 seeds = ["100.100.185.44:50051"]
 ```
 
+Finer-grained access comes from your tailnet policy instead of per-node
+config. A caller not on the allow-lists gets exactly the roles named in the
+`haasonsaas.dev/cap/flotilla` application grant (rename it with `grant_cap`):
+
+```jsonc
+"grants": [
+  {
+    "src": ["group:ops"],
+    "dst": ["tag:fleet"],
+    "ip":  ["tcp:7400"],
+    "app": { "haasonsaas.dev/cap/flotilla": [{ "roles": ["read", "exec"] }] }
+  }
+]
+```
+
+Roles: `read` (status, records, events, logs, file downloads), `write`
+(records, so jobs and desired state), `exec` (run processes, upload files),
+`sync` (the peer protocol), `admin` (all). Allow-listed users and tags hold
+every role.
+
 All keys and defaults are in `crates/flotillad/src/config.rs`.
 
 ## Usage

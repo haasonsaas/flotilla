@@ -109,22 +109,37 @@ impl IntoResponse for AppError {
 type ApiResult<T> = std::result::Result<T, AppError>;
 
 pub fn router(state: AppState) -> Router {
-    let authed = Router::new()
+    use auth::{require_role, Role};
+    let read = Router::new()
         .route("/v1/self", get(get_self))
         .route("/v1/peers", get(get_peers))
         .route("/v1/status", get(get_status))
         .route("/v1/records", get(list_records))
+        .route("/v1/records/{*key}", get(get_record))
+        .route("/v1/syncstate", get(get_sync_state))
+        .route("/v1/jobs/{id}/log", get(get_job_log))
+        .route("/v1/files", get(get_file))
+        .route("/v1/events", get(get_events))
+        .route_layer(axum::middleware::from_fn(require_role(Role::Read)));
+    let write = Router::new()
         .route(
             "/v1/records/{*key}",
-            get(get_record).put(put_record).delete(delete_record),
+            axum::routing::put(put_record).delete(delete_record),
         )
+        .route_layer(axum::middleware::from_fn(require_role(Role::Write)));
+    let sync = Router::new()
         .route("/v1/sync", post(post_sync))
-        .route("/v1/syncstate", get(get_sync_state))
         .route("/v1/syncnow", post(post_sync_now))
+        .route_layer(axum::middleware::from_fn(require_role(Role::Sync)));
+    let exec = Router::new()
         .route("/v1/exec", post(post_exec))
-        .route("/v1/jobs/{id}/log", get(get_job_log))
-        .route("/v1/files", get(get_file).put(put_file))
-        .route("/v1/events", get(get_events))
+        .route("/v1/files", axum::routing::put(put_file))
+        .route_layer(axum::middleware::from_fn(require_role(Role::Exec)));
+    let authed = Router::new()
+        .merge(read)
+        .merge(write)
+        .merge(sync)
+        .merge(exec)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_peer,

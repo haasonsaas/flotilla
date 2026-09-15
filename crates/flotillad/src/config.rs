@@ -13,6 +13,10 @@ pub struct Config {
     pub allowed_users: Vec<String>,
     /// Tailscale node tags allowed to call this daemon (e.g. `tag:fleet`).
     pub allowed_tags: Vec<String>,
+    /// Tailscale application capability consulted for roles, e.g. a policy
+    /// grant `"app": {"haasonsaas.dev/cap/flotilla": [{"roles": ["read"]}]}`.
+    /// Callers matched by allowed_users/allowed_tags get every role.
+    pub grant_cap: String,
     /// Extra labels advertised in this node's facts.
     pub labels: Labels,
     /// Path to the tailscale CLI. Auto-detected if unset.
@@ -75,6 +79,7 @@ impl Default for Config {
             data_dir: default_data_dir(),
             allowed_users: Vec::new(),
             allowed_tags: Vec::new(),
+            grant_cap: "haasonsaas.dev/cap/flotilla".into(),
             labels: Labels::new(),
             tailscale_bin: None,
             max_concurrent_jobs: 2,

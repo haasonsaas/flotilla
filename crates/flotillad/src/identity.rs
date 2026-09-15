@@ -27,6 +27,9 @@ pub struct WhoIs {
     pub name: String,
     pub login: String,
     pub tags: Vec<String>,
+    /// Application capabilities granted to this caller by the tailnet
+    /// policy (`grants[].app`), as returned in `whois`'s `CapMap`.
+    pub caps: std::collections::BTreeMap<String, Vec<Value>>,
 }
 
 pub enum IdentityProvider {
@@ -228,6 +231,17 @@ impl Tailscale {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    caps: v
+                        .get("CapMap")
+                        .and_then(Value::as_object)
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| {
+                                    (k.clone(), v.as_array().cloned().unwrap_or_default())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             }
             Err(e) => {
@@ -320,6 +334,7 @@ impl StaticIdentity {
                     name: me.name.clone(),
                     login: sc.login.clone(),
                     tags: vec![],
+                    caps: Default::default(),
                 },
             );
         }
@@ -334,6 +349,7 @@ impl StaticIdentity {
                         name: p.name.clone(),
                         login: sc.login.clone(),
                         tags: vec![],
+                        caps: Default::default(),
                     },
                 );
             }
@@ -369,6 +385,7 @@ impl StaticIdentity {
                     name: "loopback".into(),
                     login: self.login.clone(),
                     tags: vec![],
+                    caps: Default::default(),
                 })
             } else {
                 None
