@@ -179,3 +179,28 @@ pub struct FileQuery {
     #[serde(default)]
     pub mode: Option<String>,
 }
+
+/// One change to the replicated store, as streamed by `GET /v1/events`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordEvent {
+    pub key: String,
+    pub author: String,
+    pub hlc: crate::hlc::Hlc,
+    pub deleted: bool,
+    pub value: serde_json::Value,
+    /// Unix ms when this node observed the change.
+    pub at_ms: u64,
+}
+
+impl From<&Record> for RecordEvent {
+    fn from(r: &Record) -> Self {
+        RecordEvent {
+            key: r.key.clone(),
+            author: r.author.clone(),
+            hlc: r.hlc,
+            deleted: r.deleted,
+            value: r.value.clone(),
+            at_ms: crate::now_ms(),
+        }
+    }
+}

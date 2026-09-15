@@ -53,11 +53,10 @@ fn log_dir() -> PathBuf {
 
 /// Block until the freshly started daemon answers on loopback, so a
 /// `flotilla install && flotilla status` never races the restart.
-fn wait_for_health() -> Result<()> {
+async fn wait_for_health() -> Result<()> {
     let port = crate::configured_port();
     let url = format!("http://127.0.0.1:{port}/v1/health");
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(500))
             .build()?;
@@ -74,7 +73,7 @@ fn wait_for_health() -> Result<()> {
             crate::client::pause(std::time::Duration::from_millis(250)).await;
         }
         bail!("daemon did not answer on {url} within 10s; check the log")
-    })
+    }
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
@@ -99,7 +98,7 @@ fn plist_path() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-pub fn install(args: InstallArgs) -> Result<()> {
+pub async fn install(args: InstallArgs) -> Result<()> {
     let daemon = find_daemon(args.daemon_path)?;
     let log = log_dir().join("flotillad.log");
     let plist = format!(
@@ -135,7 +134,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
         .output();
     run(Command::new("launchctl").args(["bootstrap", &domain, &path.to_string_lossy()]))?;
     run(Command::new("launchctl").args(["kickstart", "-k", &format!("{domain}/{LABEL}")]))?;
-    wait_for_health()?;
+    wait_for_health().await?;
     println!(
         "installed {LABEL} -> {} (log: {})",
         daemon.display(),
@@ -145,7 +144,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn uninstall() -> Result<()> {
+pub async fn uninstall() -> Result<()> {
     let path = plist_path();
     let uid = unsafe { libc_getuid() };
     let _ = Command::new("launchctl")
@@ -175,7 +174,7 @@ fn unit_path() -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-pub fn install(args: InstallArgs) -> Result<()> {
+pub async fn install(args: InstallArgs) -> Result<()> {
     let daemon = find_daemon(args.daemon_path)?;
     let unit = format!(
         "[Unit]\nDescription=flotilla fleet daemon\nAfter=network-online.target tailscaled.service\n\n[Service]\nExecStart={}\nRestart=always\nRestartSec=3\nEnvironment=RUST_LOG=info\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\n\n[Install]\nWantedBy=default.target\n",
@@ -187,7 +186,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
     run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
     run(Command::new("systemctl").args(["--user", "enable", "--now", "flotillad.service"]))?;
     run(Command::new("systemctl").args(["--user", "restart", "flotillad.service"]))?;
-    wait_for_health()?;
+    wait_for_health().await?;
     println!(
         "installed flotillad.service -> {} (logs: journalctl --user -u flotillad)",
         daemon.display()
@@ -196,7 +195,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn uninstall() -> Result<()> {
+pub async fn uninstall() -> Result<()> {
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "--now", "flotillad.service"])
         .output();
@@ -212,11 +211,11 @@ pub fn uninstall() -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn install(_args: InstallArgs) -> Result<()> {
+pub async fn install(_args: InstallArgs) -> Result<()> {
     bail!("install is only supported on macOS and Linux")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn uninstall() -> Result<()> {
+pub async fn uninstall() -> Result<()> {
     bail!("uninstall is only supported on macOS and Linux")
 }

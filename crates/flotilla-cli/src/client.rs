@@ -64,6 +64,46 @@ impl Client {
         self.get("/v1/peers").await
     }
 
+    /// Subscribe to store changes under `prefix` as they happen.
+    pub async fn events(&self, prefix: &str) -> Result<impl Stream<Item = Result<RecordEvent>>> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/events", self.base))
+            .query(&[("prefix", prefix)])
+            .send()
+            .await
+            .with_context(|| format!("connecting to {}", self.base))?;
+        let resp = Self::check(resp).await?;
+        let mut buf = String::new();
+        Ok(resp.bytes_stream().flat_map(move |chunk| {
+            let mut out = Vec::new();
+            match chunk {
+                Ok(bytes) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(i) = buf.find("\n\n") {
+                        let frame: String = buf.drain(..i + 2).collect();
+                        let mut is_record = false;
+                        let mut data = String::new();
+                        for line in frame.lines() {
+                            if let Some(v) = line.strip_prefix("event:") {
+                                is_record = v.trim() == "record";
+                            } else if let Some(v) = line.strip_prefix("data:") {
+                                data.push_str(v.trim());
+                            }
+                        }
+                        if is_record && !data.is_empty() {
+                            out.push(
+                                serde_json::from_str::<RecordEvent>(&data).map_err(Into::into),
+                            );
+                        }
+                    }
+                }
+                Err(e) => out.push(Err(e.into())),
+            }
+            futures::stream::iter(out)
+        }))
+    }
+
     pub async fn sync_state(&self) -> Result<SyncStateResponse> {
         self.get("/v1/syncstate").await
     }

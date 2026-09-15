@@ -32,7 +32,53 @@ fn ms_ago(ms: u64) -> String {
     age(flotilla_core::now_ms().saturating_sub(ms) / 1000)
 }
 
-pub async fn status(c: &Client, json: bool) -> Result<()> {
+/// Re-run `render` whenever a matching record changes (debounced) and at
+/// least every `fallback`, until interrupted.
+async fn watch_loop<F, Fut>(c: &Client, prefix: &str, fallback: Duration, render: F) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    loop {
+        print!("\x1b[2J\x1b[H");
+        render().await?;
+        println!("\n(watching; ctrl-c to stop)");
+        let mut events = match c.events(prefix).await {
+            Ok(e) => e,
+            Err(_) => {
+                pause(fallback).await;
+                continue;
+            }
+        };
+        // wait for one event or the fallback tick, then debounce briefly
+        let _ = tokio::time::timeout(fallback, events.next()).await;
+        pause(Duration::from_millis(300)).await;
+    }
+}
+
+pub async fn status(c: &Client, json: bool, watch: bool) -> Result<()> {
+    if watch {
+        return watch_loop(c, keys::NODE, Duration::from_secs(5), || {
+            status_once(c, json)
+        })
+        .await;
+    }
+    status_once(c, json).await
+}
+
+pub async fn events(c: &Client, prefix: &str) -> Result<()> {
+    let mut stream = c.events(prefix).await?;
+    let out = std::io::stdout();
+    while let Some(ev) = stream.next().await {
+        let ev = ev?;
+        let mut o = out.lock();
+        writeln!(o, "{}", serde_json::to_string(&ev)?)?;
+        o.flush()?;
+    }
+    Ok(())
+}
+
+async fn status_once(c: &Client, json: bool) -> Result<()> {
     let st = c.status().await?;
     if json {
         return print_json(&st);
@@ -378,6 +424,9 @@ pub enum JobCmd {
         /// Include finished jobs older than this many hours (default 24)
         #[arg(long, default_value_t = 24)]
         hours: u64,
+        /// Re-render as jobs change
+        #[arg(long, short)]
+        watch: bool,
     },
     /// Show one job
     Show { id: String },
@@ -524,79 +573,14 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
             }
             Ok(())
         }
-        JobCmd::Ls { hours } => {
-            let names = node_names(c).await?;
-            let cutoff = flotilla_core::now_ms().saturating_sub(hours * 3_600_000);
-            let jobs: Vec<JobView> = load_jobs(c)
-                .await?
-                .into_iter()
-                .filter(|j| {
-                    j.result.is_none() || j.result.as_ref().unwrap().finished_at_ms >= cutoff
+        JobCmd::Ls { hours, watch } => {
+            if watch {
+                return watch_loop(c, "", Duration::from_secs(5), || {
+                    job_ls_once(c, hours, json)
                 })
-                .collect();
-            if json {
-                let v: Vec<serde_json::Value> = jobs.iter().map(|j| serde_json::json!({"spec": j.spec, "claim": j.claim, "result": j.result, "state": j.state})).collect();
-                return print_json(&v);
+                .await;
             }
-            let mut t = Table::new();
-            t.load_preset(UTF8_FULL_CONDENSED);
-            t.set_header([
-                "id",
-                "state",
-                "node",
-                "exit",
-                "submitted",
-                "by",
-                "target",
-                "cmd",
-            ]);
-            for j in jobs {
-                let state = match j.state {
-                    JobState::Succeeded => Cell::new("succeeded").fg(Color::Green),
-                    JobState::Failed => Cell::new("failed").fg(Color::Red),
-                    JobState::Claimed => Cell::new("running").fg(Color::Yellow),
-                    JobState::Orphaned => Cell::new("orphaned").fg(Color::Red),
-                    JobState::Pending => Cell::new("pending"),
-                    JobState::Cancelled => Cell::new("cancelled").fg(Color::DarkGrey),
-                };
-                let node = j
-                    .claim
-                    .as_ref()
-                    .map(|c| {
-                        names
-                            .get(&c.node)
-                            .cloned()
-                            .unwrap_or_else(|| c.node.clone())
-                    })
-                    .unwrap_or_default();
-                let exit = j
-                    .result
-                    .as_ref()
-                    .map(|r| {
-                        r.exit_code
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| r.error.clone().unwrap_or("?".into()))
-                    })
-                    .unwrap_or_default();
-                let target = j
-                    .spec
-                    .node
-                    .as_ref()
-                    .map(|n| names.get(n).cloned().unwrap_or_else(|| n.clone()))
-                    .unwrap_or_else(|| j.spec.selector.to_string());
-                t.add_row(vec![
-                    Cell::new(&j.spec.id[..8]),
-                    state,
-                    Cell::new(node),
-                    Cell::new(exit),
-                    Cell::new(ms_ago(j.spec.submitted_at_ms)),
-                    Cell::new(&j.spec.submitted_by),
-                    Cell::new(target),
-                    Cell::new(shell_words(&j.spec.cmd)),
-                ]);
-            }
-            println!("{t}");
-            Ok(())
+            job_ls_once(c, hours, json).await
         }
         JobCmd::Show { id } => {
             let id = resolve_job(c, &id).await?;
@@ -717,6 +701,79 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn job_ls_once(c: &Client, hours: u64, json: bool) -> Result<()> {
+    let names = node_names(c).await?;
+    let cutoff = flotilla_core::now_ms().saturating_sub(hours * 3_600_000);
+    let jobs: Vec<JobView> = load_jobs(c)
+        .await?
+        .into_iter()
+        .filter(|j| j.result.is_none() || j.result.as_ref().unwrap().finished_at_ms >= cutoff)
+        .collect();
+    if json {
+        let v: Vec<serde_json::Value> = jobs.iter().map(|j| serde_json::json!({"spec": j.spec, "claim": j.claim, "result": j.result, "state": j.state})).collect();
+        return print_json(&v);
+    }
+    let mut t = Table::new();
+    t.load_preset(UTF8_FULL_CONDENSED);
+    t.set_header([
+        "id",
+        "state",
+        "node",
+        "exit",
+        "submitted",
+        "by",
+        "target",
+        "cmd",
+    ]);
+    for j in jobs {
+        let state = match j.state {
+            JobState::Succeeded => Cell::new("succeeded").fg(Color::Green),
+            JobState::Failed => Cell::new("failed").fg(Color::Red),
+            JobState::Claimed => Cell::new("running").fg(Color::Yellow),
+            JobState::Orphaned => Cell::new("orphaned").fg(Color::Red),
+            JobState::Pending => Cell::new("pending"),
+            JobState::Cancelled => Cell::new("cancelled").fg(Color::DarkGrey),
+        };
+        let node = j
+            .claim
+            .as_ref()
+            .map(|c| {
+                names
+                    .get(&c.node)
+                    .cloned()
+                    .unwrap_or_else(|| c.node.clone())
+            })
+            .unwrap_or_default();
+        let exit = j
+            .result
+            .as_ref()
+            .map(|r| {
+                r.exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| r.error.clone().unwrap_or("?".into()))
+            })
+            .unwrap_or_default();
+        let target = j
+            .spec
+            .node
+            .as_ref()
+            .map(|n| names.get(n).cloned().unwrap_or_else(|| n.clone()))
+            .unwrap_or_else(|| j.spec.selector.to_string());
+        t.add_row(vec![
+            Cell::new(&j.spec.id[..8]),
+            state,
+            Cell::new(node),
+            Cell::new(exit),
+            Cell::new(ms_ago(j.spec.submitted_at_ms)),
+            Cell::new(&j.spec.submitted_by),
+            Cell::new(target),
+            Cell::new(shell_words(&j.spec.cmd)),
+        ]);
+    }
+    println!("{t}");
+    Ok(())
 }
 
 async fn wait(c: &Client, id: &str, json: bool) -> Result<()> {
@@ -1155,7 +1212,7 @@ pub async fn upgrade(c: &Client, args: UpgradeArgs) -> Result<()> {
                     std::fs::rename(&tmp, dir.join(b))?;
                 }
             }
-            crate::install::install(crate::install::InstallArgs { daemon_path: None })?;
+            crate::install::install(crate::install::InstallArgs { daemon_path: None }).await?;
             println!("[{name}] reinstalled from {}", dir.display());
         } else {
             let mut cmd = std::process::Command::new("sh");

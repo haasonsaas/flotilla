@@ -36,6 +36,8 @@ pub struct AppState {
     pub running: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Per-peer sync bookkeeping, keyed like `sync_loop::Candidate::key`.
     pub sync_state: Arc<Mutex<HashMap<String, PeerSyncState>>>,
+    /// Every applied store change, for `/v1/events` subscribers.
+    pub events: tokio::sync::broadcast::Sender<RecordEvent>,
 }
 
 impl AppState {
@@ -45,6 +47,11 @@ impl AppState {
         store: Arc<Store>,
         me: NodeInfo,
     ) -> AppState {
+        let (events, _) = tokio::sync::broadcast::channel::<RecordEvent>(1024);
+        let tx = events.clone();
+        store.on_change(move |r| {
+            let _ = tx.send(RecordEvent::from(r));
+        });
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .connect_timeout(std::time::Duration::from_secs(3))
@@ -58,6 +65,7 @@ impl AppState {
             http,
             running: Arc::new(Mutex::new(HashMap::new())),
             sync_state: Arc::new(Mutex::new(HashMap::new())),
+            events,
         }
     }
 
@@ -116,6 +124,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/exec", post(post_exec))
         .route("/v1/jobs/{id}/log", get(get_job_log))
         .route("/v1/files", get(get_file).put(put_file))
+        .route("/v1/events", get(get_events))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_peer,
@@ -377,6 +386,46 @@ fn resolve_path(p: &str) -> std::result::Result<std::path::PathBuf, String> {
         return Err(format!("path must not contain ..: {p}"));
     }
     Ok(path)
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    prefix: String,
+}
+
+/// Server-sent events of store changes, optionally filtered by key prefix.
+/// A subscriber that falls behind gets a `lagged` event and continues.
+async fn get_events(State(state): State<AppState>, Query(q): Query<EventsQuery>) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let rx = state.events.subscribe();
+    let prefix = q.prefix;
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |item| {
+        let prefix = prefix.clone();
+        async move {
+            match item {
+                Ok(ev) if ev.key.starts_with(&prefix) => {
+                    Some(Ok::<Event, std::convert::Infallible>(
+                        Event::default()
+                            .event("record")
+                            .json_data(&ev)
+                            .unwrap_or_else(|_| Event::default()),
+                    ))
+                }
+                Ok(_) => None,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    Some(Ok(Event::default().event("lagged").data(n.to_string())))
+                }
+            }
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 async fn get_file(

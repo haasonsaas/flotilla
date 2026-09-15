@@ -109,11 +109,14 @@ impl Default for StoreOptions {
     }
 }
 
+type Listener = Box<dyn Fn(&Record) + Send + Sync>;
+
 pub struct Store {
     db: Database,
     me: NodeId,
     clock: Arc<Clock>,
     opts: StoreOptions,
+    listeners: std::sync::Mutex<Vec<Listener>>,
 }
 
 impl Store {
@@ -157,6 +160,7 @@ impl Store {
             me,
             clock,
             opts,
+            listeners: std::sync::Mutex::new(Vec::new()),
         };
         store.rebuild_index_if_missing()?;
         Ok(store)
@@ -186,6 +190,18 @@ impl Store {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Register a callback invoked after every local write or applied merge.
+    /// Callbacks run on the writing thread and must not block.
+    pub fn on_change(&self, f: impl Fn(&Record) + Send + Sync + 'static) {
+        self.listeners.lock().unwrap().push(Box::new(f));
+    }
+
+    fn notify(&self, rec: &Record) {
+        for l in self.listeners.lock().unwrap().iter() {
+            l(rec);
+        }
     }
 
     pub fn me(&self) -> &NodeId {
@@ -324,6 +340,9 @@ impl Store {
             }
         };
         txn.commit()?;
+        if outcome == MergeOutcome::Applied {
+            self.notify(incoming);
+        }
         Ok(outcome)
     }
 
@@ -452,6 +471,7 @@ impl Store {
             }
         }
         txn.commit()?;
+        self.notify(rec);
         Ok(())
     }
 }
@@ -618,6 +638,33 @@ mod tests {
             ..far
         };
         assert_eq!(a.merge_checked(&near).unwrap(), MergeOutcome::Applied);
+    }
+
+    #[test]
+    fn listeners_fire_on_write_and_applied_merge_only() {
+        let a = Store::in_memory("a").unwrap();
+        let b = Store::in_memory("b").unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        b.on_change(move |r| {
+            s2.lock()
+                .unwrap()
+                .push((r.key.clone(), r.author.clone(), r.deleted))
+        });
+        let ra = a.put("k", json!(1)).unwrap();
+        b.merge(&ra).unwrap();
+        b.merge(&ra).unwrap(); // superseded: no event
+        b.put("local", json!(2)).unwrap();
+        b.delete("local").unwrap();
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                ("k".to_string(), "a".to_string(), false),
+                ("local".to_string(), "b".to_string(), false),
+                ("local".to_string(), "b".to_string(), true),
+            ]
+        );
     }
 
     #[test]

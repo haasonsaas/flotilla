@@ -29,13 +29,23 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Show every node the fleet knows about
-    Status,
+    Status {
+        /// Re-render as the fleet changes
+        #[arg(long, short)]
+        watch: bool,
+    },
     /// Show this node's identity as seen by the daemon
     Whoami,
     /// List Tailscale peers as seen by the local daemon
     Peers,
     /// Force a sync round with one peer (name, id, or seed address) or with everyone
     Sync { peer: Option<String> },
+    /// Stream store changes as newline-delimited JSON
+    Events {
+        /// Only keys under this prefix (e.g. job/)
+        #[arg(default_value = "")]
+        prefix: String,
+    },
     /// Run a command on selected nodes and stream the output
     Run(commands::RunArgs),
     /// Durable jobs: submitted into the replicated store, run by whichever eligible node claims them
@@ -68,19 +78,20 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", configured_port()));
     let client = client::Client::new(&daemon);
     match cli.cmd {
-        Cmd::Status => commands::status(&client, cli.json).await,
+        Cmd::Status { watch } => commands::status(&client, cli.json, watch).await,
         Cmd::Whoami => commands::whoami(&client, cli.json).await,
         Cmd::Peers => commands::peers(&client, cli.json).await,
         Cmd::Sync { peer } => commands::sync(&client, peer, cli.json).await,
+        Cmd::Events { prefix } => commands::events(&client, &prefix).await,
         Cmd::Run(args) => commands::run(&client, args).await,
         Cmd::Job(cmd) => commands::job(&client, cmd, cli.json).await,
         Cmd::Desired(cmd) => commands::desired(&client, cmd, cli.json).await,
         Cmd::Records(cmd) => commands::records(&client, cmd).await,
-        Cmd::Install(args) => install::install(args),
+        Cmd::Install(args) => install::install(args).await,
         Cmd::Push(args) => commands::push(&client, args).await,
         Cmd::Pull(args) => commands::pull(&client, args).await,
         Cmd::Upgrade(args) => commands::upgrade(&client, args).await,
-        Cmd::Uninstall => install::uninstall(),
+        Cmd::Uninstall => install::uninstall().await,
     }
 }
 

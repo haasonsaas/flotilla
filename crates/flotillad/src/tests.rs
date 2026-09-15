@@ -665,3 +665,52 @@ async fn files_round_trip_and_reject_bad_paths() {
     }
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_stream_reports_changes_with_prefix_filter() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    let resp = a
+        .http
+        .get(format!("{}/v1/events", a.base))
+        .query(&[("prefix", "test/")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.bytes_stream();
+    a.state
+        .store
+        .put("other/ignored", serde_json::json!(0))
+        .unwrap();
+    a.state
+        .store
+        .put("test/one", serde_json::json!({"n": 1}))
+        .unwrap();
+    a.state.store.delete("test/one").unwrap();
+    let mut buf = String::new();
+    let mut got: Vec<RecordEvent> = Vec::new();
+    while got.len() < 2 {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .expect("event within 10s")
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        for line in buf.lines() {
+            if let Some(json) = line.strip_prefix("data:") {
+                if let Ok(ev) = serde_json::from_str::<RecordEvent>(json.trim()) {
+                    if !got.iter().any(|g| g.hlc == ev.hlc) {
+                        got.push(ev);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(got[0].key, "test/one");
+    assert!(!got[0].deleted);
+    assert_eq!(got[1].key, "test/one");
+    assert!(got[1].deleted);
+    std::fs::remove_dir_all(dir).ok();
+}
