@@ -128,13 +128,34 @@ fn ifconfig_mac(iface: &str) -> Option<String> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .find_map(|l| {
-            l.trim()
-                .strip_prefix("ether ")
-                .map(|m| m.split_whitespace().next().unwrap_or("").to_lowercase())
-        })
-        .filter(|m| m.len() == 17 && m != "02:00:00:00:00:00")
+    let raw = text.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("ether ")
+            .map(|m| m.split_whitespace().next().unwrap_or("").to_lowercase())
+    })?;
+    // macOS ifconfig drops leading zeros ("3c:6:30:1:2:3"); normalise.
+    let octets: Vec<String> = raw.split(':').map(|o| format!("{:0>2}", o)).collect();
+    if octets.len() != 6
+        || octets
+            .iter()
+            .any(|o| o.len() != 2 || u8::from_str_radix(o, 16).is_err())
+    {
+        return None;
+    }
+    let mac = octets.join(":");
+    (mac != "02:00:00:00:00:00" && mac != "00:00:00:00:00:00").then_some(mac)
+}
+
+#[cfg(test)]
+mod mac_tests {
+    #[test]
+    fn normalises_short_octets() {
+        let octets: Vec<String> = "3c:6:30:1:2:ab"
+            .split(':')
+            .map(|o| format!("{:0>2}", o))
+            .collect();
+        assert_eq!(octets.join(":"), "3c:06:30:01:02:ab");
+    }
 }
 
 /// Physical-looking interfaces with a private IPv4 and a real MAC.
