@@ -70,6 +70,14 @@ enum Cmd {
     Session(commands::SessionCmd),
     /// Send wake-on-LAN for an offline node from every online node on its LAN
     Wake { node: String },
+    /// Open the dashboard in your browser (this node, or a peer's)
+    Web {
+        /// Node name or id (default: the local daemon)
+        node: Option<String>,
+        /// Print the URL instead of opening it
+        #[arg(long)]
+        print: bool,
+    },
     /// Batches: shard one command across the fleet, chain a final job, wait on all of it
     #[command(subcommand)]
     Batch(commands::BatchCmd),
@@ -106,6 +114,7 @@ async fn main() -> Result<()> {
         Cmd::Wake { node } => commands::wake(&client, &node).await,
         Cmd::Agent(cmd) => commands::agent(&client, cmd, cli.json).await,
         Cmd::Batch(cmd) => commands::batch(&client, cmd, cli.json).await,
+        Cmd::Web { node, print } => commands::web(&client, node.as_deref(), print).await,
         Cmd::Uninstall => install::uninstall().await,
     }
 }

@@ -145,7 +145,7 @@ flotilla agent run --cwd ~/code/mono -- grok -p "resolve the conflict in PR 9138
 flotilla agent ls                              # every agent run, node, elapsed, last output line
 flotilla agent attach 3fa1                     # ssh -t into its tmux session on the executor
 flotilla job submit --pick least-load -- cargo test   # any job can ask for the idlest node
-open http://127.0.0.1:7400/                    # dashboard (also reachable on the tailnet IP)
+flotilla web                                   # open the dashboard; `flotilla web dev-desktop-1` opens that node's
 ```
 
 Agent runs are ordinary jobs with a `tmux` session name and the `least-load`

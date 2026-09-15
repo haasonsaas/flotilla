@@ -2359,3 +2359,45 @@ async fn ensure_online(c: &Client, node: Option<&str>, selector: &Selector) -> R
     }
     bail!("no eligible node came online within 3 minutes")
 }
+
+// ---------------------------------------------------------------------------
+
+/// Open the dashboard: the local daemon's by default, or a peer's over the
+/// tailnet (that daemon authorises you through whois like any other call).
+pub async fn web(c: &Client, node: Option<&str>, print: bool) -> Result<()> {
+    let url = match node {
+        None => format!("{}/", c.base),
+        Some(n) => {
+            let st = c.status().await?;
+            let target = st
+                .nodes
+                .iter()
+                .find(|x| x.facts.name == n || x.facts.node_id == n)
+                .ok_or_else(|| anyhow!("unknown node {n:?}"))?;
+            if target.facts.node_id == st.me {
+                format!("{}/", c.base)
+            } else {
+                format!("{}/", node_url(c, &st, target)?.base)
+            }
+        }
+    };
+    if print {
+        println!("{url}");
+        return Ok(());
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    match std::process::Command::new(opener).arg(&url).status() {
+        Ok(s) if s.success() => {
+            println!("{url}");
+            Ok(())
+        }
+        _ => {
+            println!("{url}");
+            bail!("could not launch {opener}; open the URL above yourself")
+        }
+    }
+}
