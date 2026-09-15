@@ -550,3 +550,118 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
     assert_eq!(claim.node, "id-other");
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gc_retires_old_jobs_and_keeps_recent() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    let now = flotilla_core::now_ms();
+    let mk = |id: &str, finished: u64| {
+        let spec = JobSpec {
+            id: id.into(),
+            cmd: vec!["true".into()],
+            cwd: None,
+            env: Default::default(),
+            selector: Default::default(),
+            node: Some("elsewhere".into()),
+            submitted_by: "test".into(),
+            submitted_at_ms: finished - 1000,
+            timeout_secs: None,
+            cancelled: false,
+        };
+        let result = JobResult {
+            job_id: id.into(),
+            node: "id-elsewhere".into(),
+            exit_code: Some(0),
+            started_at_ms: finished - 500,
+            finished_at_ms: finished,
+            output_tail: String::new(),
+            error: None,
+        };
+        a.state.store.put_json(&keys::job(id), &spec).unwrap();
+        a.state.store.put_json(&keys::result(id), &result).unwrap();
+    };
+    let retention_ms = a.state.cfg.job_retention_hours * 3600 * 1000;
+    mk("old", now - retention_ms - 60_000);
+    mk("recent", now - 60_000);
+    std::fs::write(a.state.cfg.job_log_path("old"), "log").unwrap();
+    crate::gc::pass(&a.state).unwrap();
+    assert!(a.state.store.get(&keys::job("old")).unwrap().is_none());
+    assert!(a.state.store.get(&keys::result("old")).unwrap().is_none());
+    assert!(!a.state.cfg.job_log_path("old").exists());
+    assert!(a.state.store.get(&keys::job("recent")).unwrap().is_some());
+    assert!(a
+        .state
+        .store
+        .get(&keys::result("recent"))
+        .unwrap()
+        .is_some());
+    // horizon moved to now - gc_horizon_days
+    assert!(a.state.store.horizon().unwrap().wall_ms() > 0);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_round_trip_and_reject_bad_paths() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    let target = dir.join("sub").join("payload.bin");
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let resp = a
+        .http
+        .put(format!("{}/v1/files", a.base))
+        .query(&[
+            ("path", target.to_string_lossy().as_ref()),
+            ("mode", "0755"),
+        ])
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let info: FileWriteResponse = resp.json().await.unwrap();
+    assert_eq!(info.bytes, payload.len() as u64);
+    assert_eq!(std::fs::read(&target).unwrap(), payload);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+    assert!(!target.with_file_name("payload.bin.flotilla-tmp").exists());
+
+    let back = a
+        .http
+        .get(format!("{}/v1/files", a.base))
+        .query(&[("path", target.to_string_lossy().as_ref())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(back.status(), 200);
+    assert_eq!(back.bytes().await.unwrap().to_vec(), payload);
+
+    let missing = a
+        .http
+        .get(format!("{}/v1/files", a.base))
+        .query(&[("path", "/definitely/not/here")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    for bad in ["relative/path", "/tmp/../etc/passwd"] {
+        let r = a
+            .http
+            .put(format!("{}/v1/files", a.base))
+            .query(&[("path", bad)])
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad}");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

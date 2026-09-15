@@ -945,3 +945,283 @@ pub async fn records(c: &Client, cmd: RecordsCmd) -> Result<()> {
         },
     }
 }
+
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct PushArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+    /// Octal mode on the destination, e.g. 0755
+    #[arg(long)]
+    mode: Option<String>,
+    /// Local file
+    src: std::path::PathBuf,
+    /// Destination path on each node (absolute or ~/...)
+    dst: String,
+}
+
+fn sha256_file(p: &std::path::Path) -> Result<String> {
+    use sha2::Digest;
+    let mut f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
+    let mut h = sha2::Sha256::new();
+    std::io::copy(&mut f, &mut h)?;
+    Ok(hex::encode(h.finalize()))
+}
+
+pub async fn push(c: &Client, args: PushArgs) -> Result<()> {
+    let st = c.status().await?;
+    let targets: Vec<NodeStatus> = args
+        .target
+        .pick(&st)?
+        .into_iter()
+        .filter(|n| n.online)
+        .collect();
+    if targets.is_empty() {
+        bail!("no online targets");
+    }
+    let local_sha = sha256_file(&args.src)?;
+    let mut failed = false;
+    for n in targets {
+        let client = node_url(c, &st, &n)?;
+        match client
+            .put_file(&args.src, &args.dst, args.mode.as_deref())
+            .await
+        {
+            Ok(r) if r.sha256 == local_sha => {
+                println!("[{}] {} ({} bytes)", n.facts.name, r.path, r.bytes)
+            }
+            Ok(r) => {
+                failed = true;
+                eprintln!(
+                    "[{}] checksum mismatch after upload: {} != {}",
+                    n.facts.name, r.sha256, local_sha
+                );
+            }
+            Err(e) => {
+                failed = true;
+                eprintln!("[{}] error: {e:#}", n.facts.name);
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug)]
+pub struct PullArgs {
+    /// Node name or id
+    node: String,
+    /// Path on the node
+    src: String,
+    /// Local destination (default: the basename in the current directory)
+    dst: Option<std::path::PathBuf>,
+}
+
+pub async fn pull(c: &Client, args: PullArgs) -> Result<()> {
+    let st = c.status().await?;
+    let n = st
+        .nodes
+        .iter()
+        .find(|n| n.facts.name == args.node || n.facts.node_id == args.node)
+        .ok_or_else(|| anyhow!("unknown node {:?}", args.node))?;
+    if !n.online {
+        bail!("{} is offline", n.facts.name);
+    }
+    let dst = args.dst.unwrap_or_else(|| {
+        std::path::PathBuf::from(
+            std::path::Path::new(&args.src)
+                .file_name()
+                .map(|s| s.to_os_string())
+                .unwrap_or_else(|| "download".into()),
+        )
+    });
+    let client = node_url(c, &st, n)?;
+    let bytes = client.get_file(&args.src, &dst).await?;
+    println!("{} bytes -> {}", bytes, dst.display());
+    Ok(())
+}
+
+#[derive(Args, Debug)]
+pub struct UpgradeArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+    /// Push this machine's flotilla/flotillad binaries instead of fetching a release.
+    /// Only nodes with the same OS and architecture are upgraded.
+    #[arg(long)]
+    local: bool,
+    /// Directory holding flotilla and flotillad for --local (default: this binary's directory)
+    #[arg(long)]
+    from_dir: Option<std::path::PathBuf>,
+    /// Release tag to install (default: latest)
+    #[arg(long)]
+    version: Option<String>,
+    /// Also upgrade this node, last
+    #[arg(long)]
+    include_self: bool,
+}
+
+const INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/haasonsaas/flotilla/main/scripts/install.sh";
+
+pub async fn upgrade(c: &Client, args: UpgradeArgs) -> Result<()> {
+    let st = c.status().await?;
+    let mut targets: Vec<NodeStatus> = args
+        .target
+        .pick(&st)?
+        .into_iter()
+        .filter(|n| n.online)
+        .collect();
+    let me_idx = targets.iter().position(|n| n.facts.node_id == st.me);
+    let me_node = me_idx.map(|i| targets.remove(i));
+    if targets.is_empty() && (me_node.is_none() || !args.include_self) {
+        bail!("no online targets");
+    }
+    let from_dir = match &args.from_dir {
+        Some(d) => d.clone(),
+        None => std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| anyhow!("no parent dir"))?
+            .to_path_buf(),
+    };
+    let local_os = std::env::consts::OS;
+    let local_arch = std::env::consts::ARCH;
+    let mut failed = false;
+
+    for n in targets {
+        let name = n.facts.name.clone();
+        let old_version = n.facts.version.clone();
+        let client = node_url(c, &st, &n)?;
+        let outcome: Result<()> = async {
+            if args.local {
+                let node_os = n.facts.labels.get("os").cloned().unwrap_or_default();
+                if node_os != local_os || n.facts.arch != local_arch {
+                    bail!("skipped: {node_os}/{} does not match this machine's {local_os}/{local_arch}; use a release instead", n.facts.arch);
+                }
+                if n.facts.exe_path.is_empty() {
+                    bail!("node has not reported its executable path yet (old version?)");
+                }
+                let dir = std::path::Path::new(&n.facts.exe_path).parent().ok_or_else(|| anyhow!("bad exe_path"))?.to_string_lossy().into_owned();
+                for b in ["flotillad", "flotilla"] {
+                    let src = from_dir.join(b);
+                    let sha = sha256_file(&src)?;
+                    let r = client.put_file(&src, &format!("{dir}/{b}.new"), Some("0755")).await?;
+                    if r.sha256 != sha {
+                        bail!("checksum mismatch uploading {b}");
+                    }
+                }
+                let script = format!("mv -f '{dir}/flotillad.new' '{dir}/flotillad' && mv -f '{dir}/flotilla.new' '{dir}/flotilla' && exec '{dir}/flotilla' install");
+                run_remote_install(&client, &name, script).await
+            } else {
+                let mut env = BTreeMap::new();
+                if let Some(v) = &args.version {
+                    env.insert("FLOTILLA_VERSION".to_string(), v.clone());
+                }
+                if !n.facts.exe_path.is_empty() {
+                    if let Some(dir) = std::path::Path::new(&n.facts.exe_path).parent() {
+                        env.insert("FLOTILLA_BIN_DIR".to_string(), dir.to_string_lossy().into_owned());
+                    }
+                }
+                let script = format!("curl -fsSL {INSTALL_SCRIPT_URL} | sh");
+                run_remote_install_env(&client, &name, script, env).await
+            }
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                let new_version = wait_for_version(&client, &old_version).await;
+                println!(
+                    "[{name}] {old_version} -> {}",
+                    new_version.unwrap_or_else(|| "unknown (daemon not back yet)".into())
+                );
+            }
+            Err(e) => {
+                failed = true;
+                eprintln!("[{name}] {e:#}");
+            }
+        }
+    }
+
+    if let (Some(me), true) = (me_node, args.include_self) {
+        let name = me.facts.name.clone();
+        if args.local {
+            let dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
+            if from_dir != dir {
+                for b in ["flotillad", "flotilla"] {
+                    let tmp = dir.join(format!("{b}.new"));
+                    std::fs::copy(from_dir.join(b), &tmp)?;
+                    std::fs::rename(&tmp, dir.join(b))?;
+                }
+            }
+            crate::install::install(crate::install::InstallArgs { daemon_path: None })?;
+            println!("[{name}] reinstalled from {}", dir.display());
+        } else {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("curl -fsSL {INSTALL_SCRIPT_URL} | sh"));
+            if let Some(v) = &args.version {
+                cmd.env("FLOTILLA_VERSION", v);
+            }
+            let status = cmd.status()?;
+            if !status.success() {
+                failed = true;
+                eprintln!("[{name}] install script failed: {status}");
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn run_remote_install(client: &Client, name: &str, script: String) -> Result<()> {
+    run_remote_install_env(client, name, script, BTreeMap::new()).await
+}
+
+/// Run the install step over exec. The daemon restarts itself part-way
+/// through, which drops our stream; that is expected, so a broken stream
+/// after output started counts as success and `wait_for_version` verifies.
+async fn run_remote_install_env(
+    client: &Client,
+    name: &str,
+    script: String,
+    env: BTreeMap<String, String>,
+) -> Result<()> {
+    let req = ExecRequest {
+        cmd: vec!["sh".into(), "-c".into(), script],
+        cwd: None,
+        env,
+        timeout_secs: Some(600),
+    };
+    let mut frames = client.exec(&req).await?;
+    let mut saw_output = false;
+    while let Some(f) = frames.next().await {
+        match f {
+            Ok(ExecFrame::Stdout { data }) | Ok(ExecFrame::Stderr { data }) => {
+                saw_output = true;
+                eprint!("[{name}] {data}");
+            }
+            Ok(ExecFrame::Exit { code: Some(0) }) => return Ok(()),
+            Ok(ExecFrame::Exit { code }) => bail!("install exited with {code:?}"),
+            Ok(ExecFrame::Error { message }) => bail!("install error: {message}"),
+            Err(_) if saw_output => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_version(client: &Client, old: &str) -> Option<String> {
+    for _ in 0..30 {
+        pause(Duration::from_secs(1)).await;
+        if let Ok(me) = client.me().await {
+            if me.version != old {
+                return Some(me.version);
+            }
+        }
+    }
+    client.me().await.ok().map(|m| m.version)
+}

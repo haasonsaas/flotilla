@@ -173,6 +173,63 @@ impl Client {
         }
         Ok(Some(Self::check(resp).await?.text().await?))
     }
+
+    /// Upload a local file to a path on the node.
+    pub async fn put_file(
+        &self,
+        local: &std::path::Path,
+        remote: &str,
+        mode: Option<&str>,
+    ) -> Result<FileWriteResponse> {
+        let f = tokio::fs::File::open(local)
+            .await
+            .with_context(|| format!("opening {}", local.display()))?;
+        let len = f.metadata().await?.len();
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(f));
+        let mut q = vec![("path", remote.to_string())];
+        if let Some(m) = mode {
+            q.push(("mode", m.to_string()));
+        }
+        let resp = self
+            .http
+            .put(format!("{}/v1/files", self.base))
+            .query(&q)
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(body)
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await
+            .with_context(|| format!("connecting to {}", self.base))?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
+    /// Download a path on the node into a local file. Returns bytes written.
+    pub async fn get_file(&self, remote: &str, local: &std::path::Path) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+        let resp = self
+            .http
+            .get(format!("{}/v1/files", self.base))
+            .query(&[("path", remote)])
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await?;
+        let resp = Self::check(resp).await?;
+        if let Some(parent) = local.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        let mut f = tokio::fs::File::create(local)
+            .await
+            .with_context(|| format!("creating {}", local.display()))?;
+        let mut n = 0u64;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            n += chunk.len() as u64;
+            f.write_all(&chunk).await?;
+        }
+        f.flush().await?;
+        Ok(n)
+    }
 }
 
 fn urlencode(s: &str) -> String {

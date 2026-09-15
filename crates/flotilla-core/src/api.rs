@@ -160,3 +160,22 @@ pub struct SyncNowResult {
     pub pushed: usize,
     pub error: Option<String>,
 }
+
+/// Result of `PUT /v1/files`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileWriteResponse {
+    /// Absolute path as written on the node.
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Query for `/v1/files`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FileQuery {
+    /// Absolute, or `~/...` relative to the daemon user's home.
+    pub path: String,
+    /// Octal mode for writes, e.g. "0755". Default 0644.
+    #[serde(default)]
+    pub mode: Option<String>,
+}

@@ -79,6 +79,9 @@ pub fn collect(state: &AppState) -> NodeFacts {
         port: state.cfg.port,
         reported_at_ms: flotilla_core::now_ms(),
         running_jobs: state.running_jobs(),
+        exe_path: std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     }
 }
 

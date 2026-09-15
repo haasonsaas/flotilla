@@ -115,6 +115,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/syncnow", post(post_sync_now))
         .route("/v1/exec", post(post_exec))
         .route("/v1/jobs/{id}/log", get(get_job_log))
+        .route("/v1/files", get(get_file).put(put_file))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_peer,
@@ -360,6 +361,125 @@ async fn get_job_log(State(state): State<AppState>, Path(id): Path<String>) -> A
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Resolve a client-supplied path: expand `~`, require absolute, refuse `..`.
+fn resolve_path(p: &str) -> std::result::Result<std::path::PathBuf, String> {
+    let expanded = exec::expand_home(p);
+    let path = std::path::PathBuf::from(&expanded);
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute or start with ~/: {p}"));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("path must not contain ..: {p}"));
+    }
+    Ok(path)
+}
+
+async fn get_file(
+    State(_state): State<AppState>,
+    Query(q): Query<FileQuery>,
+) -> ApiResult<Response> {
+    let path = match resolve_path(&q.path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok((StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response())
+        }
+    };
+    match tokio::fs::File::open(&path).await {
+        Ok(f) => {
+            let len = f.metadata().await.map(|m| m.len()).ok();
+            let stream = tokio_util::io::ReaderStream::new(f);
+            let mut resp = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream");
+            if let Some(len) = len {
+                resp = resp.header(header::CONTENT_LENGTH, len);
+            }
+            Ok(resp.body(Body::from_stream(stream)).unwrap())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: format!("no such file: {}", path.display()),
+            }),
+        )
+            .into_response()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Stream the body into `<path>.flotilla-tmp`, then rename over `path`, so a
+/// running binary keeps its old inode and readers never see a partial file.
+async fn put_file(
+    State(_state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<FileQuery>,
+    body: Body,
+) -> ApiResult<Response> {
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+    let path = match resolve_path(&q.path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok((StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response())
+        }
+    };
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_file_name(format!(
+        "{}.flotilla-tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let mut f = tokio::fs::File::create(&tmp).await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut bytes: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: format!("upload aborted: {e}"),
+                    }),
+                )
+                    .into_response());
+            }
+        };
+        hasher.update(&chunk);
+        bytes += chunk.len() as u64;
+        f.write_all(&chunk).await?;
+    }
+    f.flush().await?;
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = q
+            .mode
+            .as_deref()
+            .and_then(|m| u32::from_str_radix(m.trim_start_matches("0o"), 8).ok())
+            .unwrap_or(0o644);
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await?;
+    }
+    tokio::fs::rename(&tmp, &path).await?;
+    let sha256 = hex::encode(hasher.finalize());
+    tracing::info!(path = %path.display(), bytes, by = %caller.login, from = %caller.name, "file written");
+    Ok(Json(FileWriteResponse {
+        path: path.to_string_lossy().into_owned(),
+        bytes,
+        sha256,
+    })
+    .into_response())
 }
 
 /// Wait for a duration without a timer primitive that can be mistaken for

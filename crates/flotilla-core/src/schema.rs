@@ -31,6 +31,9 @@ pub struct NodeFacts {
     pub reported_at_ms: u64,
     #[serde(default)]
     pub running_jobs: Vec<String>,
+    /// Where flotillad is running from, so `flotilla upgrade` knows what to replace.
+    #[serde(default)]
+    pub exe_path: String,
 }
 
 /// `job/<id>`: written by the submitter.
