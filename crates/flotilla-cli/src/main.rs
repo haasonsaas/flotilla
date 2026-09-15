@@ -49,6 +49,12 @@ enum Cmd {
     Records(commands::RecordsCmd),
     /// Install flotillad as a user service (launchd on macOS, systemd on Linux)
     Install(install::InstallArgs),
+    /// Copy a local file to one or more nodes
+    Push(commands::PushArgs),
+    /// Copy a file from a node to a local path
+    Pull(commands::PullArgs),
+    /// Upgrade flotilla on nodes: from the latest GitHub release, or by pushing this machine's binaries
+    Upgrade(commands::UpgradeArgs),
     /// Remove the user service
     Uninstall,
 }
@@ -71,13 +77,16 @@ async fn main() -> Result<()> {
         Cmd::Desired(cmd) => commands::desired(&client, cmd, cli.json).await,
         Cmd::Records(cmd) => commands::records(&client, cmd).await,
         Cmd::Install(args) => install::install(args),
+        Cmd::Push(args) => commands::push(&client, args).await,
+        Cmd::Pull(args) => commands::pull(&client, args).await,
+        Cmd::Upgrade(args) => commands::upgrade(&client, args).await,
         Cmd::Uninstall => install::uninstall(),
     }
 }
 
 /// Port from the daemon config file, so the CLI follows a non-default port
 /// without flags. Only the `port` key is read.
-fn configured_port() -> u16 {
+pub fn configured_port() -> u16 {
     let path = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".config")))

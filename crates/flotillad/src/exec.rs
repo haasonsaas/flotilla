@@ -36,6 +36,10 @@ async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecF
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Own process group, so a kill reaches grandchildren (`sh -c 'x | y'`)
+    // and not just the shell we spawned.
+    #[cfg(unix)]
+    cmd.process_group(0);
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(expand_home(cwd));
     }
@@ -57,8 +61,11 @@ async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecF
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
-    let out_task = pump(stdout, tx.clone(), |d| ExecFrame::Stdout { data: d });
-    let err_task = pump(stderr, tx.clone(), |d| ExecFrame::Stderr { data: d });
+    // Spawned, not merely created: output must flow while the process runs,
+    // both so callers see it live and so a chatty child never blocks on a
+    // full pipe.
+    let mut out_task = tokio::spawn(pump(stdout, tx.clone(), |d| ExecFrame::Stdout { data: d }));
+    let mut err_task = tokio::spawn(pump(stderr, tx.clone(), |d| ExecFrame::Stderr { data: d }));
 
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let wait = async {
@@ -82,6 +89,7 @@ async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecF
             None
         }
         None => {
+            kill_group(&child);
             let _ = child.kill().await;
             let why = if cancel.is_cancelled() {
                 "cancelled"
@@ -96,9 +104,33 @@ async fn run(req: ExecRequest, cancel: CancellationToken, tx: mpsc::Sender<ExecF
             None
         }
     };
-    let _ = tokio::join!(out_task, err_task);
+    // After a normal exit the pipes close on their own. After a kill a
+    // stray grandchild could still hold them open, so don't wait forever.
+    let drain = async {
+        let _ = tokio::join!(&mut out_task, &mut err_task);
+    };
+    if tokio::time::timeout(Duration::from_secs(2), drain)
+        .await
+        .is_err()
+    {
+        out_task.abort();
+        err_task.abort();
+    }
     let _ = tx.send(ExecFrame::Exit { code }).await;
 }
+
+#[cfg(unix)]
+fn kill_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: plain syscall on a pid we spawned into its own group.
+        unsafe {
+            libc::killpg(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_child: &tokio::process::Child) {}
 
 async fn pump<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
@@ -272,6 +304,95 @@ mod tests {
         assert!(frames.contains(&ExecFrame::Stdout {
             data: "yes\n".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_grandchildren_too() {
+        // `sh -c` spawns tail as a grandchild; killing only sh would leave
+        // the pipe open and the marker process alive.
+        let marker = format!("flotilla-gc-{}", std::process::id());
+        let cancel = CancellationToken::new();
+        let mut rx = spawn(
+            ExecRequest {
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("echo up; tail -f /dev/null; echo {marker}"),
+                ],
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
+        loop {
+            match rx.recv().await {
+                Some(ExecFrame::Stdout { .. }) => break,
+                Some(_) => continue,
+                None => panic!("stream ended early"),
+            }
+        }
+        let start = std::time::Instant::now();
+        cancel.cancel();
+        let mut frames = Vec::new();
+        while let Some(f) = rx.recv().await {
+            frames.push(f);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait on the grandchild's pipe"
+        );
+        assert_eq!(frames.last(), Some(&ExecFrame::Exit { code: None }));
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, ExecFrame::Stdout { data } if data.contains(&marker))),
+            "shell continued after kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_grandchildren_too() {
+        let start = std::time::Instant::now();
+        let frames = collect(ExecRequest {
+            cmd: vec!["sh".into(), "-c".into(), "tail -f /dev/null".into()],
+            timeout_secs: Some(1),
+            ..Default::default()
+        })
+        .await;
+        assert!(start.elapsed() < Duration::from_secs(6));
+        assert_eq!(frames.last(), Some(&ExecFrame::Exit { code: None }));
+    }
+
+    #[tokio::test]
+    async fn output_streams_before_the_process_exits() {
+        // First line arrives while the process is still running, and the
+        // stream doesn't end until the process is killed.
+        let cancel = CancellationToken::new();
+        let mut rx = spawn(
+            ExecRequest {
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo first; tail -f /dev/null".into(),
+                ],
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("first line must arrive while running");
+        assert_eq!(
+            first,
+            Some(ExecFrame::Stdout {
+                data: "first\n".into()
+            })
+        );
+        cancel.cancel();
+        let mut last = None;
+        while let Some(f) = rx.recv().await {
+            last = Some(f);
+        }
+        assert_eq!(last, Some(ExecFrame::Exit { code: None }));
     }
 
     #[test]

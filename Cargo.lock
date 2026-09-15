@@ -392,6 +392,7 @@ dependencies = [
  "directories",
  "flotilla-core",
  "futures",
+ "libc",
  "rand",
  "reqwest",
  "serde",

@@ -9,7 +9,7 @@ use std::process::Command;
 pub struct InstallArgs {
     /// Path to flotillad (default: next to this binary, else on PATH)
     #[arg(long)]
-    daemon_path: Option<PathBuf>,
+    pub daemon_path: Option<PathBuf>,
 }
 
 fn home() -> PathBuf {
@@ -41,6 +41,7 @@ fn find_daemon(explicit: Option<PathBuf>) -> Result<PathBuf> {
     bail!("flotillad not found; pass --daemon-path")
 }
 
+#[cfg(target_os = "macos")]
 fn log_dir() -> PathBuf {
     let d = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -48,6 +49,32 @@ fn log_dir() -> PathBuf {
         .join("flotilla");
     std::fs::create_dir_all(&d).ok();
     d
+}
+
+/// Block until the freshly started daemon answers on loopback, so a
+/// `flotilla install && flotilla status` never races the restart.
+fn wait_for_health() -> Result<()> {
+    let port = crate::configured_port();
+    let url = format!("http://127.0.0.1:{port}/v1/health");
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()?;
+        for _ in 0..40 {
+            if client
+                .get(&url)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            crate::client::pause(std::time::Duration::from_millis(250)).await;
+        }
+        bail!("daemon did not answer on {url} within 10s; check the log")
+    })
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
@@ -108,6 +135,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
         .output();
     run(Command::new("launchctl").args(["bootstrap", &domain, &path.to_string_lossy()]))?;
     run(Command::new("launchctl").args(["kickstart", "-k", &format!("{domain}/{LABEL}")]))?;
+    wait_for_health()?;
     println!(
         "installed {LABEL} -> {} (log: {})",
         daemon.display(),
@@ -159,6 +187,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
     run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
     run(Command::new("systemctl").args(["--user", "enable", "--now", "flotillad.service"]))?;
     run(Command::new("systemctl").args(["--user", "restart", "flotillad.service"]))?;
+    wait_for_health()?;
     println!(
         "installed flotillad.service -> {} (logs: journalctl --user -u flotillad)",
         daemon.display()

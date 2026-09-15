@@ -23,5 +23,10 @@ clap.workspace = true
 toml.workspace = true
 directories.workspace = true
 chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
 axum.workspace = true
 sysinfo.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

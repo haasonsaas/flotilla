@@ -113,6 +113,9 @@ pub async fn sync_candidate(state: &AppState, c: &Candidate) -> SyncNowResult {
     entry.url = c.url.clone();
     match &outcome {
         Ok((pulled, pushed)) => {
+            if entry.last_ok_ms.is_none() || entry.consecutive_failures > 0 {
+                tracing::info!(peer = %c.name, url = %c.url, pulled, pushed, "sync established");
+            }
             entry.last_ok_ms = Some(now);
             entry.consecutive_failures = 0;
             entry.next_try_ms = 0;
@@ -160,7 +163,16 @@ pub async fn sync_with(state: &AppState, name: &str, base: &str) -> anyhow::Resu
         .error_for_status()?
         .json()
         .await?;
-    let (pulled, push) = sync::close(&state.store, &reply)?;
+    let (stats, push) = sync::close(&state.store, &reply)?;
+    if stats.rejected() > 0 {
+        tracing::warn!(
+            peer = name,
+            before_horizon = stats.before_horizon,
+            clock_skew = stats.clock_skew,
+            "rejected records from peer"
+        );
+    }
+    let pulled = stats.applied;
     let pushed = push.records.len();
     if pushed > 0 {
         state
@@ -171,10 +183,6 @@ pub async fn sync_with(state: &AppState, name: &str, base: &str) -> anyhow::Resu
             .await?
             .error_for_status()?;
     }
-    if pulled > 0 || pushed > 0 {
-        tracing::info!(peer = name, pulled, pushed, "synced");
-    } else {
-        tracing::debug!(peer = name, "in sync");
-    }
+    tracing::debug!(peer = name, pulled, pushed, "synced");
     Ok((pulled, pushed))
 }

@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod exec;
 mod facts;
+mod gc;
 mod identity;
 mod reconcile;
 mod scheduler;
@@ -65,9 +66,12 @@ async fn main() -> Result<()> {
     }
     let cfg = Arc::new(cfg);
 
-    let store = Arc::new(flotilla_core::Store::open(
+    let store = Arc::new(flotilla_core::Store::open_with(
         &cfg.data_dir.join("store.redb"),
         me.node_id.clone(),
+        flotilla_core::store::StoreOptions {
+            max_skew_ms: cfg.max_clock_skew_secs * 1000,
+        },
     )?);
     tracing::info!(node = %me.name, id = %me.node_id, records = store.len()?, "store opened");
 
@@ -77,6 +81,47 @@ async fn main() -> Result<()> {
     tokio::spawn(sync_loop::run(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
     tokio::spawn(reconcile::run(state.clone()));
+    tokio::spawn(gc::run(state.clone()));
+    tokio::spawn(shutdown_on_signal(state.clone()));
 
     server::serve(state).await
+}
+
+/// On SIGTERM/SIGINT (launchd kickstart -k, systemctl stop), kill the
+/// process groups of running jobs before exiting so they are not orphaned.
+/// Their claims lapse and another node takes them over.
+async fn shutdown_on_signal(state: server::AppState) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    let running: Vec<(String, tokio_util::sync::CancellationToken)> = state
+        .running
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    tracing::info!(jobs = running.len(), "shutting down");
+    for (_, token) in &running {
+        token.cancel();
+    }
+    // Give the exec runners a moment to kill their process groups.
+    server::pause(std::time::Duration::from_millis(500)).await;
+    std::process::exit(0);
 }
