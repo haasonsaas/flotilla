@@ -49,6 +49,7 @@ fn job_cancelled(state: &AppState, id: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// A fresh claim (or takeover) by this node.
 fn write_claim(
     state: &AppState,
     id: &str,
@@ -65,6 +66,25 @@ fn write_claim(
         started_at_ms,
     };
     state.store.put_json(&keys::claim(id), &claim)?;
+    Ok(claim)
+}
+
+/// Extend the lease on a claim we already hold, keeping its original
+/// claimed_at and attempt so the timeline stays truthful.
+fn renew_claim(
+    state: &AppState,
+    existing: &JobClaim,
+    started_at_ms: Option<u64>,
+) -> anyhow::Result<JobClaim> {
+    let now = flotilla_core::now_ms();
+    let claim = JobClaim {
+        lease_until_ms: now + state.cfg.lease().as_millis() as u64,
+        started_at_ms: started_at_ms.or(existing.started_at_ms),
+        ..existing.clone()
+    };
+    state
+        .store
+        .put_json(&keys::claim(&existing.job_id), &claim)?;
     Ok(claim)
 }
 
@@ -118,7 +138,14 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
             Some(claim) if claim.node == state.me.node_id => {
                 // Ours (e.g. after a restart) but not running: resume it.
                 tracing::info!(job = %spec.id, "resuming own claim");
-                write_claim(state, &spec.id, claim.attempt, None)?;
+                renew_claim(
+                    state,
+                    &JobClaim {
+                        started_at_ms: None,
+                        ..claim.clone()
+                    },
+                    None,
+                )?;
                 start(state.clone(), spec, false);
             }
             Some(claim) => {
@@ -168,7 +195,7 @@ fn start(state: AppState, spec: JobSpec, settle: bool) {
         // Mark the claim as started: this is what separates `running`
         // from `claimed` for everyone reading the replicated record.
         if let Some(c) = current_claim(&state, &id) {
-            let _ = write_claim(&state, &id, c.attempt, Some(flotilla_core::now_ms()));
+            let _ = renew_claim(&state, &c, Some(flotilla_core::now_ms()));
         }
         tracing::info!(job = %id, cmd = ?spec.cmd, "running");
         match execute(&state, &spec, cancel).await {
@@ -260,7 +287,7 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
                     Some(c) if c.node == state.me.node_id => {
                         if since_renew >= renew_every {
                             since_renew = Duration::ZERO;
-                            if let Err(e) = write_claim(&state, &id, c.attempt, c.started_at_ms) {
+                            if let Err(e) = renew_claim(&state, &c, None) {
                                 tracing::warn!(job = %id, error = %e, "lease renewal failed");
                             }
                         }

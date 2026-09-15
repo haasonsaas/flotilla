@@ -514,6 +514,7 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
         .parse()
         .unwrap();
     // Lease is 3s and renewal happens every 1s once running (after the settle window).
+    let first_claimed_at = first.claimed_at_ms;
     eventually("lease renewed", || {
         a.state
             .store
@@ -525,6 +526,23 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
     })
     .await;
     assert!(a.state.running.lock().unwrap().contains_key(&id));
+    let renewed: JobClaim = a
+        .state
+        .store
+        .get(&keys::claim(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        renewed.claimed_at_ms, first_claimed_at,
+        "renewals keep the original claim time"
+    );
+    assert!(
+        renewed.started_at_ms.is_some(),
+        "running claims carry a start time"
+    );
+    assert!(renewed.started_at_ms.unwrap() >= first_claimed_at);
     // Another node steals the claim with a newer record. The executor must
     // stop and must not write a result.
     let now = flotilla_core::now_ms();
