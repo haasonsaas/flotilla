@@ -133,7 +133,36 @@ fn ifconfig_mac(iface: &str) -> Option<String> {
             .strip_prefix("ether ")
             .map(|m| m.split_whitespace().next().unwrap_or("").to_lowercase())
     })?;
-    // macOS ifconfig drops leading zeros ("3c:6:30:1:2:3"); normalise.
+    normalise_mac(&raw)
+}
+
+/// macOS masks MACs from background processes in `ifconfig`, but
+/// `networksetup -getmacaddress` still returns the hardware address, which
+/// is also the one wake-on-LAN needs.
+#[cfg(target_os = "macos")]
+fn networksetup_mac(iface: &str) -> Option<String> {
+    let out = std::process::Command::new("networksetup")
+        .args(["-getmacaddress", iface])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let raw = text
+        .split("Ethernet Address:")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .to_lowercase();
+    normalise_mac(&raw)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn networksetup_mac(_iface: &str) -> Option<String> {
+    None
+}
+
+/// Pad octets that ifconfig prints without leading zeros ("3c:6:30:1:2:3")
+/// and reject placeholders.
+fn normalise_mac(raw: &str) -> Option<String> {
     let octets: Vec<String> = raw.split(':').map(|o| format!("{:0>2}", o)).collect();
     if octets.len() != 6
         || octets
@@ -149,12 +178,13 @@ fn ifconfig_mac(iface: &str) -> Option<String> {
 #[cfg(test)]
 mod mac_tests {
     #[test]
-    fn normalises_short_octets() {
-        let octets: Vec<String> = "3c:6:30:1:2:ab"
-            .split(':')
-            .map(|o| format!("{:0>2}", o))
-            .collect();
-        assert_eq!(octets.join(":"), "3c:06:30:01:02:ab");
+    fn normalises_and_rejects() {
+        assert_eq!(
+            super::normalise_mac("3c:6:30:1:2:ab").as_deref(),
+            Some("3c:06:30:01:02:ab")
+        );
+        assert_eq!(super::normalise_mac("02:00:00:00:00:00"), None);
+        assert_eq!(super::normalise_mac("nope"), None);
     }
 }
 
@@ -174,9 +204,8 @@ pub fn lan_interfaces() -> Vec<flotilla_core::schema::LanInterface> {
         }
         let mut mac = data.mac_address().to_string().to_lowercase();
         if mac == "00:00:00:00:00:00" || mac == "02:00:00:00:00:00" {
-            // macOS reports a placeholder to unentitled processes; ifconfig
-            // still prints the real one.
-            match ifconfig_mac(name) {
+            // macOS reports a placeholder to unentitled processes.
+            match networksetup_mac(name).or_else(|| ifconfig_mac(name)) {
                 Some(real) => mac = real,
                 None => continue,
             }
