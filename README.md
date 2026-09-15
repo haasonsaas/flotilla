@@ -27,12 +27,25 @@ And the layers built on them:
 
 ## Install
 
+Prebuilt binaries for Apple Silicon and Intel Macs and for x86_64 and arm64
+Linux are attached to every tagged release. This installs the latest one into
+`~/.local/bin` and registers the daemon as a user service:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/haasonsaas/flotilla/main/scripts/install.sh | sh
+```
+
+Or build it yourself:
+
 ```sh
 cargo build --release
 cp target/release/flotilla target/release/flotillad ~/.local/bin/   # or anywhere on PATH
 flotilla install        # launchd user agent on macOS, systemd --user unit on Linux
 flotilla status
 ```
+
+Or with Nix: `nix run github:haasonsaas/flotilla -- status`, or add the flake
+as an input and put `flotilla.packages.${system}.default` in your profile.
 
 Do that on every node. The daemon binds loopback and each Tailscale IP on port
 7400. Nothing else needs to be opened; WireGuard is the wire encryption.
