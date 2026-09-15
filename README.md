@@ -29,6 +29,8 @@ And the layers built on them:
 | events | `flotilla events job/` | server-sent stream of store changes; `status --watch`, `job ls --watch` |
 | sessions | `flotilla session start -n olympus --name work --cwd ~/proj -- claude` | tmux sessions per node, listed in facts, `send`/`tail`/`attach` |
 | wake | `flotilla wake mac-mini` | wake-on-LAN sent from every online node on that LAN |
+| agents | `flotilla agent run -l os=linux --cwd ~/proj -- grok -p "fix the tests"` | a job that runs inside a tmux session on the least loaded node; `agent ls/attach/logs/stop` |
+| dashboard | `open http://127.0.0.1:7400/` | live nodes and jobs page served by every daemon, refreshed from the event stream |
 
 ## Install
 
@@ -133,7 +135,19 @@ flotilla session tail -n dev-desktop-1 codex --lines 40
 flotilla session send -n dev-desktop-1 codex -- "run the tests"
 flotilla session attach -n dev-desktop-1 codex   # ssh -t ... tmux attach
 flotilla wake mac-mini
+flotilla agent run --cwd ~/code/mono -- grok -p "resolve the conflict in PR 9138"
+flotilla agent ls                              # every agent run, node, elapsed, last output line
+flotilla agent attach 3fa1                     # ssh -t into its tmux session on the executor
+flotilla job submit --pick least-load -- cargo test   # any job can ask for the idlest node
+open http://127.0.0.1:7400/                    # dashboard (also reachable on the tailnet IP)
 ```
+
+Agent runs are ordinary jobs with a `tmux` session name and the `least-load`
+placement hint. The executor starts the command in a detached tmux session
+whose shell writes the job log and exit status to files and then signals a
+tmux wait channel; the daemon waits on that channel, so cancelling the job
+kills the session, `job logs` returns the full output, and you can attach to
+the live session at any time.
 
 On macOS, jobs run under `caffeinate -i` so a laptop on power does not doze
 mid-build (`caffeinate_jobs = false` to disable), and facts carry `xcode=<ver>`

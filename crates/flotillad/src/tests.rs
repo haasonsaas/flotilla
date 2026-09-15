@@ -998,3 +998,19 @@ async fn cancelling_a_tmux_job_kills_the_session() {
     assert!(!alive, "session must be killed on cancel");
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dashboard_is_served() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    let resp = a.http.get(format!("{}/", a.base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("/v1/events") && body.contains("<title>flotilla</title>"));
+    std::fs::remove_dir_all(dir).ok();
+}

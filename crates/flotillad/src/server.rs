@@ -124,6 +124,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/jobs/{id}/log", get(get_job_log))
         .route("/v1/files", get(get_file))
         .route("/v1/events", get(get_events))
+        .route("/", get(get_ui))
+        .route("/ui", get(get_ui))
         .route_layer(axum::middleware::from_fn(require_role(Role::Read)));
     let write = Router::new()
         .route(
@@ -463,6 +465,16 @@ async fn post_wake(
     }
     tracing::info!(mac = %req.mac, ?sent_to, "wake-on-lan sent");
     Ok(Json(WakeResponse { sent_to }).into_response())
+}
+
+/// The dashboard: a single self-contained page that reads the same API the
+/// CLI uses and refreshes on `/v1/events`.
+async fn get_ui() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("ui.html"),
+    )
+        .into_response()
 }
 
 async fn get_events(State(state): State<AppState>, Query(q): Query<EventsQuery>) -> Response {

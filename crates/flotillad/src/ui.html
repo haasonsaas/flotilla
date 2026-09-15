@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flotilla</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1a1a1a; --bg: #fafafa; --muted: #6b7280; --line: #e5e7eb; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --acc: #2563eb; --card: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e5e7eb; --bg: #0f1115; --muted: #9ca3af; --line: #262a33; --card: #161920; } }
+  body { margin: 0; padding: 20px 24px; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--fg); background: var(--bg); }
+  h1 { font-size: 18px; margin: 0 0 4px; } h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 26px 0 8px; }
+  .sub { color: var(--muted); font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+  th { font-weight: 600; color: var(--muted); font-size: 12px; } tr:last-child td { border-bottom: 0; }
+  td.cmd { white-space: normal; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-width: 46ch; overflow-wrap: anywhere; color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .on { background: var(--ok); } .off { background: var(--muted); }
+  .bar { display: inline-block; width: 90px; height: 8px; background: var(--line); border-radius: 4px; vertical-align: middle; margin-right: 6px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--acc); }
+  .bar.hot i { background: var(--bad); } .bar.warm i { background: var(--warn); }
+  .st { font-weight: 600; } .st.running { color: var(--warn); } .st.succeeded, .st.done { color: var(--ok); } .st.failed, .st.orphaned { color: var(--bad); } .st.cancelled, .st.pending { color: var(--muted); }
+  button { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 6px; cursor: pointer; } button:hover { border-color: var(--acc); }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); margin-right: 4px; }
+  #live { float: right; font-size: 12px; color: var(--muted); }
+  .empty { color: var(--muted); padding: 10px; }
+</style>
+</head>
+<body>
+<span id="live">connecting…</span>
+<h1>flotilla</h1>
+<div class="sub" id="me"></div>
+
+<h2>Nodes</h2>
+<table><thead><tr><th>node</th><th>version</th><th>load / cpu</th><th>mem free</th><th>disk free</th><th>battery</th><th>jobs</th><th>labels</th><th>facts</th></tr></thead><tbody id="nodes"></tbody></table>
+
+<h2>Agents &amp; jobs (last 24h)</h2>
+<table><thead><tr><th>id</th><th>kind</th><th>state</th><th>node</th><th>session</th><th>submitted</th><th>elapsed</th><th>exit</th><th>command</th><th></th></tr></thead><tbody id="jobs"></tbody></table>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const ago = (ms) => { const s = Math.max(0, Math.floor((Date.now() - ms) / 1000)); return s < 90 ? s + "s" : s < 5400 ? Math.floor(s/60) + "m" : s < 172800 ? Math.floor(s/3600) + "h" : Math.floor(s/86400) + "d"; };
+const dur = (a, b) => { const s = Math.max(0, Math.floor((b - a) / 1000)); return s < 90 ? s + "s" : Math.floor(s/60) + "m" + (s%60) + "s"; };
+async function j(url, opts) { const r = await fetch(url, opts); if (!r.ok) throw new Error(url + " -> " + r.status); return r.json(); }
+
+let names = {};
+async function render() {
+  const [st, jobs, claims, results] = await Promise.all([
+    j("/v1/status"), j("/v1/records?prefix=job/"), j("/v1/records?prefix=claim/"), j("/v1/records?prefix=result/")]);
+  names = {}; for (const n of st.nodes) names[n.facts.node_id] = n.facts.name;
+  $("me").textContent = "viewing from " + (names[st.me] || st.me) + " · " + st.nodes.filter(n => n.online).length + " of " + st.nodes.length + " nodes online";
+  $("nodes").innerHTML = st.nodes.map(n => {
+    const f = n.facts, ratio = f.cpus ? f.load_1m / f.cpus : 0, pct = Math.min(100, Math.round(ratio * 100));
+    const cls = ratio > 1 ? "hot" : ratio > 0.5 ? "warm" : "";
+    const batt = f.battery_pct != null ? f.battery_pct + "%" + (f.on_ac ? " ⚡" : "") : (f.on_ac ? "ac" : "–");
+    const labels = Object.entries(f.labels).filter(([k]) => !["os","arch","node"].includes(k)).map(([k,v]) => `<span class="tag">${esc(k)}=${esc(v)}</span>`).join("");
+    return `<tr><td><span class="dot ${n.online ? "on" : "off"}"></span><b>${esc(f.name)}</b>${f.node_id === st.me ? " *" : ""}<div class="sub">${esc(f.os)} · ${esc(f.arch)}</div></td>
+      <td>${esc(f.version)}</td><td><span class="bar ${cls}"><i style="width:${pct}%"></i></span>${f.load_1m.toFixed(1)} / ${f.cpus}</td>
+      <td>${(f.mem_free_mb/1024).toFixed(1)} GB</td><td>${f.disk_free_gb} GB</td><td>${batt}</td><td>${f.running_jobs.length}</td><td>${labels}</td><td>${ago(f.reported_at_ms)} ago</td></tr>`;
+  }).join("") || `<tr><td colspan="9" class="empty">no facts yet</td></tr>`;
+
+  const byJob = (recs, key) => Object.fromEntries(recs.records.map(r => [r.value[key], r.value]));
+  const cl = byJob(claims, "job_id"), rs = byJob(results, "job_id");
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const rows = jobs.records.map(r => r.value).filter(s => !(rs[s.id] && rs[s.id].finished_at_ms < cutoff)).sort((a, b) => b.submitted_at_ms - a.submitted_at_ms);
+  $("jobs").innerHTML = rows.map(s => {
+    const c = cl[s.id], r = rs[s.id];
+    let state = r ? (r.exit_code === 0 ? "succeeded" : "failed") : s.cancelled ? "cancelled" : c ? (c.lease_until_ms && Date.now() > c.lease_until_ms ? "orphaned" : "running") : "pending";
+    const node = c ? (names[c.node] || c.node) : "";
+    const elapsed = c ? (r ? dur(r.started_at_ms, r.finished_at_ms) : dur(c.claimed_at_ms, Date.now())) : "";
+    const exit = r ? (r.exit_code ?? (r.error || "?")) : "";
+    const target = s.node ? (names[s.node] || s.node) : Object.entries(s.selector || {}).map(([k,v]) => k + "=" + v).join(",") || (s.pick || "any");
+    const btn = (!r && !s.cancelled) ? `<button data-id="${esc(s.id)}">cancel</button>` : "";
+    return `<tr><td title="${esc(s.id)}">${esc(s.id.slice(0,8))}</td><td>${esc(s.kind || "job")}</td><td class="st ${state}">${state}</td><td>${esc(node)}<div class="sub">${esc(target)}</div></td>
+      <td>${esc(s.tmux || "")}</td><td>${ago(s.submitted_at_ms)} ago<div class="sub">${esc(s.submitted_by)}</div></td><td>${elapsed}</td><td>${esc(exit)}</td><td class="cmd">${esc(s.cmd.join(" "))}</td><td>${btn}</td></tr>`;
+  }).join("") || `<tr><td colspan="10" class="empty">no jobs</td></tr>`;
+  for (const b of document.querySelectorAll("button[data-id]")) b.onclick = () => cancel(b.dataset.id);
+}
+async function cancel(id) {
+  const rec = await j("/v1/records/job/" + id);
+  rec.value.cancelled = true;
+  await fetch("/v1/records/job/" + id, { method: "PUT", headers: {"content-type": "application/json"}, body: JSON.stringify({ value: rec.value }) });
+  render();
+}
+let timer = null;
+function schedule() { clearTimeout(timer); timer = setTimeout(() => render().catch(e => { $("live").textContent = e.message; }), 300); }
+function listen() {
+  const es = new EventSource("/v1/events");
+  es.addEventListener("record", schedule);
+  es.onopen = () => { $("live").textContent = "live"; };
+  es.onerror = () => { $("live").textContent = "reconnecting…"; };
+}
+render().catch(e => { $("live").textContent = e.message; });
+listen();
+setInterval(schedule, 15000);
+</script>
+</body>
+</html>
