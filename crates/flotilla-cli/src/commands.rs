@@ -1542,3 +1542,80 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+
+/// Wake a node by MAC. The magic packet has to originate on the target's LAN,
+/// so it is sent from this daemon and from every online node whose last
+/// known LAN subnet matches the target's.
+pub async fn wake(c: &Client, node: &str) -> Result<()> {
+    let st = c.status().await?;
+    let target = st
+        .nodes
+        .iter()
+        .find(|n| n.facts.name == node || n.facts.node_id == node)
+        .ok_or_else(|| anyhow!("unknown node {node:?}"))?;
+    if target.facts.lan.is_empty() {
+        bail!("{} never reported a LAN interface (needs a build with wake support to have run there once)", target.facts.name);
+    }
+    let same_subnet = |a: &str, ap: u8, b: &str| -> bool {
+        match (
+            a.parse::<std::net::Ipv4Addr>(),
+            b.parse::<std::net::Ipv4Addr>(),
+        ) {
+            (Ok(a), Ok(b)) => {
+                let mask = if ap == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - ap as u32)
+                };
+                u32::from(a) & mask == u32::from(b) & mask
+            }
+            _ => false,
+        }
+    };
+    let mut senders: Vec<(String, Client)> = vec![("local".into(), c.clone())];
+    for n in st
+        .nodes
+        .iter()
+        .filter(|n| n.online && n.facts.node_id != st.me && n.facts.node_id != target.facts.node_id)
+    {
+        let on_lan = target.facts.lan.iter().any(|t| {
+            n.facts
+                .lan
+                .iter()
+                .any(|h| same_subnet(&t.ip, t.prefix, &h.ip))
+        });
+        if on_lan {
+            if let Ok(client) = node_url(c, &st, n) {
+                senders.push((n.facts.name.clone(), client));
+            }
+        }
+    }
+    let mut any = false;
+    for iface in &target.facts.lan {
+        let req = WakeRequest {
+            mac: iface.mac.clone(),
+            targets: vec![iface.ip.clone()],
+        };
+        for (name, client) in &senders {
+            match client.wake(&req).await {
+                Ok(r) => {
+                    any = true;
+                    println!(
+                        "[{name}] sent for {} ({}) via {}",
+                        iface.mac,
+                        iface.name,
+                        r.sent_to.join(", ")
+                    );
+                }
+                Err(e) => eprintln!("[{name}] {e:#}"),
+            }
+        }
+    }
+    if !any {
+        bail!("no packet was sent");
+    }
+    println!("sent; {} should show online in `flotilla status` within a minute if wake-on-LAN is enabled on it", target.facts.name);
+    Ok(())
+}

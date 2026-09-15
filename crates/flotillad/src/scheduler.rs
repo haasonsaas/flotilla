@@ -165,7 +165,7 @@ enum Outcome {
 async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) -> Outcome {
     let started = flotilla_core::now_ms();
     let req = ExecRequest {
-        cmd: spec.cmd.clone(),
+        cmd: wrap_caffeinate(state, spec.cmd.clone()),
         cwd: spec.cwd.clone(),
         env: spec.env.clone(),
         timeout_secs: spec.timeout_secs,
@@ -245,4 +245,21 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
         output_tail: tail.into_string(),
         error,
     })
+}
+
+/// On macOS, keep the machine awake for the duration of the job. caffeinate
+/// runs the command and exits with its status, so nothing else changes.
+fn wrap_caffeinate(state: &AppState, cmd: Vec<String>) -> Vec<String> {
+    if !state.cfg.caffeinate_jobs || !cfg!(target_os = "macos") || cmd.is_empty() {
+        return cmd;
+    }
+    let present = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("caffeinate").is_file()))
+        .unwrap_or(false);
+    if !present {
+        return cmd;
+    }
+    let mut wrapped = vec!["caffeinate".to_string(), "-i".to_string()];
+    wrapped.extend(cmd);
+    wrapped
 }

@@ -37,6 +37,19 @@ pub struct NodeFacts {
     /// tmux sessions on this node, for the sessions layer.
     #[serde(default)]
     pub sessions: Vec<SessionInfo>,
+    /// Wired/wireless interfaces with a private IPv4, for wake-on-LAN.
+    #[serde(default)]
+    pub lan: Vec<LanInterface>,
+}
+
+/// A LAN interface as reported by a node.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LanInterface {
+    pub name: String,
+    pub ip: String,
+    pub prefix: u8,
+    /// Lowercase colon-separated MAC, e.g. `a4:83:e7:12:34:56`.
+    pub mac: String,
 }
 
 /// A tmux session as seen on a node.

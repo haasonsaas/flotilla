@@ -134,6 +134,7 @@ pub fn router(state: AppState) -> Router {
     let exec = Router::new()
         .route("/v1/exec", post(post_exec))
         .route("/v1/files", axum::routing::put(put_file))
+        .route("/v1/wake", post(post_wake))
         .route_layer(axum::middleware::from_fn(require_role(Role::Exec)));
     let authed = Router::new()
         .merge(read)
@@ -411,6 +412,51 @@ struct EventsQuery {
 
 /// Server-sent events of store changes, optionally filtered by key prefix.
 /// A subscriber that falls behind gets a `lagged` event and continues.
+/// Send a wake-on-LAN magic packet from this node: to the broadcast address
+/// of each LAN interface, to the limited broadcast, and to any extra targets.
+async fn post_wake(
+    State(_state): State<AppState>,
+    Json(req): Json<WakeRequest>,
+) -> ApiResult<Response> {
+    let Some(mac) = parse_mac(&req.mac) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: format!("bad mac {:?}", req.mac),
+            }),
+        )
+            .into_response());
+    };
+    let packet = magic_packet(mac);
+    let mut dests: Vec<String> = vec!["255.255.255.255".into()];
+    for iface in crate::facts::lan_interfaces() {
+        if let Ok(ip) = iface.ip.parse::<std::net::Ipv4Addr>() {
+            let mask = if iface.prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - iface.prefix as u32)
+            };
+            let bcast = std::net::Ipv4Addr::from(u32::from(ip) | !mask);
+            dests.push(bcast.to_string());
+        }
+    }
+    dests.extend(req.targets.iter().cloned());
+    dests.sort();
+    dests.dedup();
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    sock.set_broadcast(true)?;
+    let mut sent_to = Vec::new();
+    for d in &dests {
+        for port in [9u16, 7] {
+            if sock.send_to(&packet, (d.as_str(), port)).await.is_ok() {
+                sent_to.push(format!("{d}:{port}"));
+            }
+        }
+    }
+    tracing::info!(mac = %req.mac, ?sent_to, "wake-on-lan sent");
+    Ok(Json(WakeResponse { sent_to }).into_response())
+}
+
 async fn get_events(State(state): State<AppState>, Query(q): Query<EventsQuery>) -> Response {
     use axum::response::sse::{Event, KeepAlive, Sse};
     let rx = state.events.subscribe();

@@ -43,6 +43,12 @@ pub fn collect(state: &AppState) -> NodeFacts {
     labels.insert("os".into(), std::env::consts::OS.into());
     labels.insert("arch".into(), std::env::consts::ARCH.into());
     labels.insert("node".into(), state.me.name.clone());
+    if let Some(x) = xcode_version() {
+        labels.insert("xcode".into(), x);
+    }
+    if which_exists("tmux") {
+        labels.insert("tmux".into(), "yes".into());
+    }
     for (k, v) in &state.cfg.labels {
         labels.insert(k.clone(), v.clone());
     }
@@ -80,6 +86,7 @@ pub fn collect(state: &AppState) -> NodeFacts {
         reported_at_ms: flotilla_core::now_ms(),
         running_jobs: state.running_jobs(),
         sessions: tmux_sessions(),
+        lan: lan_interfaces(),
         exe_path: std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
@@ -88,6 +95,68 @@ pub fn collect(state: &AppState) -> NodeFacts {
 
 /// tmux sessions visible to the daemon's user (same default socket the
 /// user's terminals use). Empty if tmux is absent or no server runs.
+fn which_exists(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// `xcodebuild -version` is slow, so it is read once per process.
+fn xcode_version() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if !cfg!(target_os = "macos") || !which_exists("xcodebuild") {
+                return None;
+            }
+            let out = std::process::Command::new("xcodebuild")
+                .arg("-version")
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .next()?
+                .strip_prefix("Xcode ")
+                .map(|v| v.trim().to_string())
+        })
+        .clone()
+}
+
+/// Physical-looking interfaces with a private IPv4 and a real MAC.
+pub fn lan_interfaces() -> Vec<flotilla_core::schema::LanInterface> {
+    let nets = sysinfo::Networks::new_with_refreshed_list();
+    let mut out = Vec::new();
+    for (name, data) in nets.iter() {
+        if name.starts_with("lo")
+            || name.starts_with("utun")
+            || name.starts_with("tailscale")
+            || name.starts_with("docker")
+            || name.starts_with("br-")
+            || name.starts_with("veth")
+        {
+            continue;
+        }
+        let mac = data.mac_address();
+        if mac.0 == [0; 6] {
+            continue;
+        }
+        for net in data.ip_networks() {
+            if let std::net::IpAddr::V4(v4) = net.addr {
+                if v4.is_private() {
+                    out.push(flotilla_core::schema::LanInterface {
+                        name: name.clone(),
+                        ip: v4.to_string(),
+                        prefix: net.prefix,
+                        mac: mac.to_string().to_lowercase(),
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 pub fn tmux_sessions() -> Vec<flotilla_core::schema::SessionInfo> {
     let out = match std::process::Command::new("tmux")
         .args([

@@ -104,6 +104,17 @@ impl Client {
         }))
     }
 
+    pub async fn wake(&self, req: &WakeRequest) -> Result<WakeResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/wake", self.base))
+            .json(req)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
     pub async fn sync_state(&self) -> Result<SyncStateResponse> {
         self.get("/v1/syncstate").await
     }

@@ -204,3 +204,59 @@ impl From<&Record> for RecordEvent {
         }
     }
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WakeRequest {
+    /// MAC address in any common notation.
+    pub mac: String,
+    /// Extra unicast/broadcast IPv4 targets besides the local broadcasts.
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WakeResponse {
+    /// Destinations the magic packet was sent to.
+    pub sent_to: Vec<String>,
+}
+
+/// Parse `aa:bb:cc:dd:ee:ff`, `aa-bb-...`, or `aabbccddeeff` into bytes.
+pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 12 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// A wake-on-LAN magic packet: 6 x 0xFF then the MAC 16 times.
+pub fn magic_packet(mac: [u8; 6]) -> Vec<u8> {
+    let mut p = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        p.extend_from_slice(&mac);
+    }
+    p
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn mac_and_packet() {
+        let m = parse_mac("A4:83:E7:12:34:56").unwrap();
+        assert_eq!(m, [0xa4, 0x83, 0xe7, 0x12, 0x34, 0x56]);
+        assert_eq!(parse_mac("a4-83-e7-12-34-56"), Some(m));
+        assert_eq!(parse_mac("a483e7123456"), Some(m));
+        assert!(parse_mac("nope").is_none());
+        let p = magic_packet(m);
+        assert_eq!(p.len(), 102);
+        assert_eq!(&p[..6], &[0xff; 6]);
+        assert_eq!(&p[6..12], &m);
+        assert_eq!(&p[96..], &m);
+    }
+}

@@ -68,6 +68,8 @@ enum Cmd {
     /// tmux sessions on nodes: long-lived shells and agent sessions you can attach to
     #[command(subcommand)]
     Session(commands::SessionCmd),
+    /// Send wake-on-LAN for an offline node from every online node on its LAN
+    Wake { node: String },
     /// Remove the user service
     Uninstall,
 }
@@ -95,6 +97,7 @@ async fn main() -> Result<()> {
         Cmd::Pull(args) => commands::pull(&client, args).await,
         Cmd::Upgrade(args) => commands::upgrade(&client, args).await,
         Cmd::Session(cmd) => commands::session(&client, cmd, cli.json).await,
+        Cmd::Wake { node } => commands::wake(&client, &node).await,
         Cmd::Uninstall => install::uninstall().await,
     }
 }

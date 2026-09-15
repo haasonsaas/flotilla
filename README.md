@@ -24,6 +24,11 @@ And the layers built on them:
 | jobs | `flotilla job submit -l os=macos -- make test` | job/claim/result records; every node runs the same claim loop |
 | desired state | `flotilla desired set mac-mini -f state.toml` | files and check/apply pairs, reconciled every 60s |
 | discovery | `-l gpu=yes` | labels in facts, matched by selectors |
+| files | `flotilla push ./bin mac-mini:~/.local/bin/bin --all` | streamed upload with atomic rename; `pull` the other way |
+| upgrade | `flotilla upgrade --all` | installs the latest release on every node, or `--local` pushes this machine's build |
+| events | `flotilla events job/` | server-sent stream of store changes; `status --watch`, `job ls --watch` |
+| sessions | `flotilla session start -n olympus --name work --cwd ~/proj -- claude` | tmux sessions per node, listed in facts, `send`/`tail`/`attach` |
+| wake | `flotilla wake mac-mini` | wake-on-LAN sent from every online node on that LAN |
 
 ## Install
 
@@ -109,7 +114,23 @@ flotilla job cancel 3fa1
 flotilla desired set mac-mini -f desired.toml
 flotilla desired status
 flotilla records ls job/                     # raw store access
+flotilla push ./script.sh ~/bin/script.sh -l os=macos --mode 0755
+flotilla pull dev-desktop-1 /var/log/syslog ./syslog
+flotilla upgrade --all                       # latest GitHub release everywhere; --local to push this build
+flotilla events job/                         # NDJSON stream of changes
+flotilla status --watch
+flotilla session ls
+flotilla session start -n dev-desktop-1 --name codex --cwd ~/proj -- codex
+flotilla session tail -n dev-desktop-1 codex --lines 40
+flotilla session send -n dev-desktop-1 codex -- "run the tests"
+flotilla session attach -n dev-desktop-1 codex   # ssh -t ... tmux attach
+flotilla wake mac-mini
 ```
+
+On macOS, jobs run under `caffeinate -i` so a laptop on power does not doze
+mid-build (`caffeinate_jobs = false` to disable), and facts carry `xcode=<ver>`
+and `tmux=yes` labels when those tools are present, so `-l xcode=16.2` works
+as a selector.
 
 A desired-state file:
 

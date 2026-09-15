@@ -32,6 +32,9 @@ pub struct Config {
     /// How long a claim stays valid without renewal. Executors renew at a
     /// third of this; a lapsed lease lets another node take the job over.
     pub job_lease_secs: u64,
+    /// macOS: wrap jobs in `caffeinate -i` so the machine stays awake while
+    /// one runs. Ignored where caffeinate is absent.
+    pub caffeinate_jobs: bool,
     pub sync_interval_secs: u64,
     pub facts_interval_secs: u64,
     pub scheduler_interval_secs: u64,
@@ -87,6 +90,7 @@ impl Default for Config {
             job_retention_hours: 72,
             max_clock_skew_secs: 3600,
             job_lease_secs: 60,
+            caffeinate_jobs: true,
             sync_interval_secs: 3,
             facts_interval_secs: 15,
             scheduler_interval_secs: 3,
