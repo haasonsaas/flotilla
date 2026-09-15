@@ -85,7 +85,8 @@ async fn node(name: &str, port: u16, peers: Vec<(&str, u16)>, dir: &std::path::P
 }
 
 async fn eventually<F: Fn() -> bool>(what: &str, f: F) {
-    for _ in 0..100 {
+    // 40s: the full suite runs many two-node daemons in parallel on CI.
+    for _ in 0..200 {
         if f() {
             return;
         }

@@ -80,7 +80,7 @@ seeds = ["100.100.185.44:50051"]
 
 Finer-grained access comes from your tailnet policy instead of per-node
 config. A caller not on the allow-lists gets exactly the roles named in the
-`haasonsaas.dev/cap/flotilla` application grant (rename it with `grant_cap`):
+`haasonsaas.com/cap/flotilla` application grant (rename it with `grant_cap`):
 
 ```jsonc
 "grants": [
@@ -88,7 +88,7 @@ config. A caller not on the allow-lists gets exactly the roles named in the
     "src": ["group:ops"],
     "dst": ["tag:fleet"],
     "ip":  ["tcp:7400"],
-    "app": { "haasonsaas.dev/cap/flotilla": [{ "roles": ["read", "exec"] }] }
+    "app": { "haasonsaas.com/cap/flotilla": [{ "roles": ["read", "exec"] }] }
   }
 ]
 ```

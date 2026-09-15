@@ -225,7 +225,7 @@ mod tests {
     fn grants_give_listed_roles_only() {
         let mut w = who("ci@example.com", &["tag:ci"]);
         w.caps.insert(
-            "haasonsaas.dev/cap/flotilla".into(),
+            "haasonsaas.com/cap/flotilla".into(),
             vec![
                 json!({"roles": ["read", "bogus"]}),
                 json!({"roles": ["exec"]}),
