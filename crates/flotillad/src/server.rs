@@ -122,6 +122,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/records/{*key}", get(get_record))
         .route("/v1/syncstate", get(get_sync_state))
         .route("/v1/jobs/{id}/log", get(get_job_log))
+        .route("/v1/jobs/{id}/artifacts", get(get_artifacts))
+        .route("/v1/jobs/{id}/artifacts/{*path}", get(get_artifact))
         .route("/v1/files", get(get_file))
         .route("/v1/events", get(get_events))
         .route("/", get(get_ui))
@@ -132,10 +134,14 @@ pub fn router(state: AppState) -> Router {
             "/v1/records/{*key}",
             axum::routing::put(put_record).delete(delete_record),
         )
+        .route("/v1/records/import", post(post_import))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .route_layer(axum::middleware::from_fn(require_role(Role::Write)));
     let sync = Router::new()
         .route("/v1/sync", post(post_sync))
         .route("/v1/syncnow", post(post_sync_now))
+        // a first sync with a long-lived peer can carry a large delta
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .route_layer(axum::middleware::from_fn(require_role(Role::Sync)));
     let exec = Router::new()
         .route("/v1/exec", post(post_exec))
@@ -380,6 +386,184 @@ async fn post_exec(
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// Base URL of the node that holds the claim for `id`, if it is not us.
+fn executor_url(state: &AppState, id: &str) -> Option<(String, String)> {
+    let claim = state
+        .store
+        .get(&keys::claim(id))
+        .ok()
+        .flatten()
+        .and_then(|r| r.parse::<flotilla_core::schema::JobClaim>().ok())?;
+    if claim.node == state.me.node_id {
+        return None;
+    }
+    let facts = state
+        .store
+        .get(&keys::node_facts(&claim.node))
+        .ok()
+        .flatten()
+        .and_then(|r| r.parse::<NodeFacts>().ok())?;
+    peer_url(&facts.tailscale_ips, facts.port).map(|u| (claim.node, u))
+}
+
+fn valid_job_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains('/') && !id.contains("..")
+}
+
+/// Proxy a GET to the executor, marking it so it never bounces back.
+async fn proxy_get(state: &AppState, url: String, query: &[(&str, String)]) -> Response {
+    let mut req = state.http.get(url).query(&[("noproxy", "true")]);
+    for (k, v) in query {
+        req = req.query(&[(k, v)]);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            match resp.bytes().await {
+                Ok(bytes) => ([(header::CONTENT_TYPE, ct)], bytes).into_response(),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    format!("executor read failed: {e}"),
+                )
+                    .into_response(),
+            }
+        }
+        Ok(resp) => (
+            StatusCode::NOT_FOUND,
+            format!("executor answered {}", resp.status()),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("executor unreachable: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ProxyQuery {
+    #[serde(default)]
+    noproxy: bool,
+}
+
+fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<ArtifactInfo>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk(&p, base, out);
+        } else if let Ok(md) = e.metadata() {
+            let rel = p
+                .strip_prefix(base)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .into_owned();
+            out.push(ArtifactInfo {
+                path: rel,
+                bytes: md.len(),
+            });
+        }
+    }
+}
+
+async fn get_artifacts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ProxyQuery>,
+) -> ApiResult<Response> {
+    if !valid_job_id(&id) {
+        return Ok((StatusCode::BAD_REQUEST, "bad job id").into_response());
+    }
+    let dir = state.cfg.job_artifacts_dir(&id);
+    if dir.is_dir() {
+        let mut list = Vec::new();
+        walk(&dir, &dir, &mut list);
+        list.sort_by(|a, b| a.path.cmp(&b.path));
+        return Ok(Json(ArtifactsResponse {
+            job_id: id,
+            node: state.me.node_id.clone(),
+            artifacts: list,
+        })
+        .into_response());
+    }
+    if q.noproxy {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            "no artifacts for that job on this node",
+        )
+            .into_response());
+    }
+    match executor_url(&state, &id) {
+        Some((_, url)) => Ok(proxy_get(&state, format!("{url}/v1/jobs/{id}/artifacts"), &[]).await),
+        None => Ok(Json(ArtifactsResponse {
+            job_id: id,
+            node: state.me.node_id.clone(),
+            artifacts: vec![],
+        })
+        .into_response()),
+    }
+}
+
+async fn get_artifact(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+    Query(q): Query<ProxyQuery>,
+) -> ApiResult<Response> {
+    if !valid_job_id(&id) || path.split('/').any(|c| c == "..") || path.starts_with('/') {
+        return Ok((StatusCode::BAD_REQUEST, "bad path").into_response());
+    }
+    let file = state.cfg.job_artifacts_dir(&id).join(&path);
+    match tokio::fs::File::open(&file).await {
+        Ok(f) => {
+            let len = f.metadata().await.map(|m| m.len()).ok();
+            let mut resp = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream");
+            if let Some(len) = len {
+                resp = resp.header(header::CONTENT_LENGTH, len);
+            }
+            Ok(resp
+                .body(Body::from_stream(tokio_util::io::ReaderStream::new(f)))
+                .unwrap())
+        }
+        Err(_) if !q.noproxy => match executor_url(&state, &id) {
+            Some((_, url)) => {
+                Ok(proxy_get(&state, format!("{url}/v1/jobs/{id}/artifacts/{path}"), &[]).await)
+            }
+            None => Ok((StatusCode::NOT_FOUND, "no such artifact").into_response()),
+        },
+        Err(_) => Ok((StatusCode::NOT_FOUND, "no such artifact").into_response()),
+    }
+}
+
+/// Merge raw records (a restore from `flotilla records dump`).
+async fn post_import(
+    State(state): State<AppState>,
+    Json(req): Json<ImportRequest>,
+) -> ApiResult<Json<ImportResponse>> {
+    let store = state.store.clone();
+    let stats = tokio::task::spawn_blocking(move || store.merge_all(&req.records)).await??;
+    tracing::info!(
+        applied = stats.applied,
+        superseded = stats.superseded,
+        rejected = stats.rejected(),
+        "records imported"
+    );
+    Ok(Json(ImportResponse {
+        applied: stats.applied,
+        superseded: stats.superseded,
+        rejected: stats.rejected(),
+    }))
 }
 
 #[derive(Deserialize)]

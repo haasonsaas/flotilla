@@ -174,6 +174,12 @@ impl Config {
         self.jobs_dir().join(format!("{id}.log"))
     }
 
+    /// Files a job writes here (env `FLOTILLA_ARTIFACTS`) are served by
+    /// `/v1/jobs/{id}/artifacts` and pulled by `flotilla job pull`.
+    pub fn job_artifacts_dir(&self, id: &str) -> PathBuf {
+        self.jobs_dir().join("artifacts").join(id)
+    }
+
     pub fn settle_window(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sync_interval_secs * 2 + 1)
     }

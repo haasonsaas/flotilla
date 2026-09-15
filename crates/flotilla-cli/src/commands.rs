@@ -444,6 +444,12 @@ pub enum JobCmd {
     Cancel { id: String },
     /// Delete a job and its claim/result records
     Rm { id: String },
+    /// Download the files a job left in $FLOTILLA_ARTIFACTS
+    Pull {
+        id: String,
+        /// Destination directory (default: ./artifacts-<id prefix>)
+        dst: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -478,6 +484,9 @@ pub struct SubmitArgs {
     /// Automatic retries on failure
     #[arg(long, default_value_t = 0)]
     retries: u32,
+    /// If no eligible node is online, wake matching offline nodes and wait
+    #[arg(long)]
+    wake: bool,
     #[arg(required = true, last = true)]
     cmd: Vec<String>,
 }
@@ -559,6 +568,14 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
     match cmd {
         JobCmd::Submit(a) => {
             let a = *a;
+            if a.wake {
+                ensure_online(
+                    c,
+                    a.node.as_deref(),
+                    &a.selector.clone().unwrap_or_default(),
+                )
+                .await?;
+            }
             let me = c.me().await?;
             let node = match &a.node {
                 Some(n) => {
@@ -784,6 +801,31 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
             spec.cancelled = true;
             c.put_json(&keys::job(&id), &spec).await?;
             println!("cancelled {id}");
+            Ok(())
+        }
+        JobCmd::Pull { id, dst } => {
+            let id = resolve_job(c, &id).await?;
+            let list = c.artifacts(&id).await?;
+            if list.artifacts.is_empty() {
+                bail!(
+                    "job {} left no artifacts (write files to $FLOTILLA_ARTIFACTS)",
+                    &id[..8]
+                );
+            }
+            let dst =
+                dst.unwrap_or_else(|| std::path::PathBuf::from(format!("artifacts-{}", &id[..8])));
+            let mut total = 0;
+            for a in &list.artifacts {
+                let n = c.artifact(&id, &a.path, &dst.join(&a.path)).await?;
+                total += n;
+                println!("{} ({} bytes)", dst.join(&a.path).display(), n);
+            }
+            println!(
+                "{} files, {} bytes -> {}",
+                list.artifacts.len(),
+                total,
+                dst.display()
+            );
             Ok(())
         }
         JobCmd::Rm { id } => {
@@ -1065,6 +1107,14 @@ pub enum RecordsCmd {
     Rm {
         key: String,
     },
+    /// Write every record (tombstones included) as JSON to a file or stdout
+    Dump {
+        file: Option<std::path::PathBuf>,
+    },
+    /// Merge records from a dump file into this node's store
+    Restore {
+        file: std::path::PathBuf,
+    },
 }
 
 pub async fn records(c: &Client, cmd: RecordsCmd) -> Result<()> {
@@ -1098,6 +1148,29 @@ pub async fn records(c: &Client, cmd: RecordsCmd) -> Result<()> {
         RecordsCmd::Put { key, json } => {
             let v: serde_json::Value = serde_json::from_str(&json).context("value must be JSON")?;
             print_json(&c.put_record(&key, v).await?)
+        }
+        RecordsCmd::Dump { file } => {
+            let records = c.list("", true).await?;
+            let text = serde_json::to_string_pretty(&records)?;
+            match file {
+                Some(f) => {
+                    std::fs::write(&f, text)?;
+                    println!("{} records -> {}", records.len(), f.display());
+                }
+                None => println!("{text}"),
+            }
+            Ok(())
+        }
+        RecordsCmd::Restore { file } => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let records: Vec<flotilla_core::Record> = serde_json::from_str(&text)?;
+            let r = c.import(records).await?;
+            println!(
+                "applied {}, superseded {}, rejected {}",
+                r.applied, r.superseded, r.rejected
+            );
+            Ok(())
         }
         RecordsCmd::Rm { key } => match c.delete_record(&key).await? {
             Some(_) => {
@@ -1774,6 +1847,9 @@ pub struct AgentRunArgs {
     /// Wait for completion and print the output tail
     #[arg(long)]
     wait: bool,
+    /// If no eligible node is online, wake matching offline nodes and wait
+    #[arg(long)]
+    wake: bool,
     #[arg(required = true, last = true)]
     cmd: Vec<String>,
 }
@@ -1781,6 +1857,14 @@ pub struct AgentRunArgs {
 pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
     match cmd {
         AgentCmd::Run(a) => {
+            if a.wake {
+                ensure_online(
+                    c,
+                    a.node.as_deref(),
+                    &a.selector.clone().unwrap_or_default(),
+                )
+                .await?;
+            }
             let me = c.me().await?;
             let node = match &a.node {
                 Some(n) => Some(resolve_node(c, n).await?.0),
@@ -2236,4 +2320,42 @@ async fn batch_wait(c: &Client, b: &str) -> Result<()> {
         }
         pause(Duration::from_secs(3)).await;
     }
+}
+
+/// With `--wake`: if no eligible node is online, send wake-on-LAN to the
+/// matching offline ones and wait for one to report facts again.
+async fn ensure_online(c: &Client, node: Option<&str>, selector: &Selector) -> Result<()> {
+    let eligible = |st: &StatusResponse| -> Vec<NodeStatus> {
+        st.nodes
+            .iter()
+            .filter(|n| match node {
+                Some(x) => n.facts.name == x || n.facts.node_id == x,
+                None => selector.matches(&n.facts.labels),
+            })
+            .cloned()
+            .collect()
+    };
+    let st = c.status().await?;
+    let cands = eligible(&st);
+    if cands.is_empty() {
+        bail!("no node matches the target");
+    }
+    if cands.iter().any(|n| n.online) {
+        return Ok(());
+    }
+    for n in &cands {
+        eprintln!("waking {}", n.facts.name);
+        if let Err(e) = wake(c, &n.facts.name).await {
+            eprintln!("  {e:#}");
+        }
+    }
+    for _ in 0..36 {
+        pause(Duration::from_secs(5)).await;
+        let st = c.status().await?;
+        if let Some(n) = eligible(&st).into_iter().find(|n| n.online) {
+            eprintln!("{} is online", n.facts.name);
+            return Ok(());
+        }
+    }
+    bail!("no eligible node came online within 3 minutes")
 }

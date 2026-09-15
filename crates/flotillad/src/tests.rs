@@ -1212,3 +1212,85 @@ async fn failed_job_is_retried_until_it_succeeds() {
     assert_eq!(s2.retry, 1);
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_artifacts_are_listed_and_served() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let mut spec = spec_for(&uuid::Uuid::new_v4().to_string(), &["sh", "-c", "mkdir -p $FLOTILLA_ARTIFACTS/sub; echo report > $FLOTILLA_ARTIFACTS/sub/out.txt; echo $FLOTILLA_JOB_ID > $FLOTILLA_ARTIFACTS/id"]);
+    spec.node = Some("solo".into());
+    a.state.store.put_json(&keys::job(&spec.id), &spec).unwrap();
+    eventually("result", || {
+        a.state
+            .store
+            .get(&keys::result(&spec.id))
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let list: ArtifactsResponse = a
+        .http
+        .get(format!("{}/v1/jobs/{}/artifacts", a.base, spec.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let paths: Vec<&str> = list.artifacts.iter().map(|x| x.path.as_str()).collect();
+    assert_eq!(paths, vec!["id", "sub/out.txt"]);
+    let body = a
+        .http
+        .get(format!(
+            "{}/v1/jobs/{}/artifacts/sub/out.txt",
+            a.base, spec.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, "report\n");
+    let bad = a
+        .http
+        .get(format!("{}/v1/jobs/{}/artifacts/../../x", a.base, spec.id))
+        .send()
+        .await
+        .unwrap();
+    assert!(bad.status() == 400 || bad.status() == 404);
+    // dump/restore: importing our own records is a no-op, a foreign one applies
+    let all: RecordsResponse = a
+        .http
+        .get(format!("{}/v1/records?raw=true", a.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut recs = all.records.clone();
+    recs.push(flotilla_core::Record {
+        key: "restored/x".into(),
+        value: serde_json::json!(1),
+        author: "id-backup".into(),
+        hlc: flotilla_core::Hlc::from_parts(flotilla_core::now_ms(), 0),
+        deleted: false,
+    });
+    let r: ImportResponse = a
+        .http
+        .post(format!("{}/v1/records/import", a.base))
+        .json(&ImportRequest { records: recs })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r.applied, 1, "{r:?}");
+    assert_eq!(r.superseded, all.records.len());
+    assert!(a.state.store.get("restored/x").unwrap().is_some());
+    std::fs::remove_dir_all(dir).ok();
+}

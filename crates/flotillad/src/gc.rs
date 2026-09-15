@@ -78,6 +78,7 @@ fn retire_jobs(state: &AppState, now: u64) -> anyhow::Result<usize> {
             state.store.delete(&key)?;
         }
         let _ = std::fs::remove_file(state.cfg.job_log_path(&spec.id));
+        let _ = std::fs::remove_dir_all(state.cfg.job_artifacts_dir(&spec.id));
         retired += 1;
     }
     Ok(retired)

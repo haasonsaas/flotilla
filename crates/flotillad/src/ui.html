@@ -34,6 +34,9 @@
   #drawer .rec { font: 12px ui-monospace, Menlo, monospace; display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
   #drawer .close { float: right; }
   .empty { color: var(--muted); padding: 10px; }
+  .filters { display: flex; gap: 8px; margin: 0 0 8px; flex-wrap: wrap; }
+  .filters select, .filters input { font: inherit; font-size: 13px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
+  .filters input { flex: 1; min-width: 200px; }
 </style>
 </head>
 <body>
@@ -45,7 +48,13 @@
 <table><thead><tr><th>node</th><th>version</th><th>load / cpu</th><th>mem free</th><th>disk free</th><th>battery</th><th>jobs</th><th>labels</th><th>facts</th></tr></thead><tbody id="nodes"></tbody></table>
 
 <h2>Agents &amp; jobs (last 24h)</h2>
-<table><thead><tr><th>id</th><th>kind</th><th>state</th><th>node</th><th>session</th><th>submitted</th><th>elapsed</th><th>exit</th><th>command</th><th></th></tr></thead><tbody id="jobs"></tbody></table>
+<div class="filters">
+  <select id="fNode"><option value="">all nodes</option></select>
+  <select id="fState"><option value="">all states</option><option>queued</option><option>claimed</option><option>running</option><option>succeeded</option><option>failed</option><option>cancelled</option><option>lost</option></select>
+  <select id="fKind"><option value="">all kinds</option></select>
+  <input id="fText" type="search" placeholder="search command, id, batch, session">
+</div>
+<table><thead><tr><th>id</th><th>kind</th><th>state</th><th>node</th><th>session / batch</th><th>submitted</th><th>elapsed</th><th>exit</th><th>command</th><th></th></tr></thead><tbody id="jobs"></tbody></table>
 
 <aside id="drawer" hidden></aside>
 <script>
@@ -74,7 +83,18 @@ async function render() {
   const byJob = (recs, key) => Object.fromEntries(recs.records.map(r => [r.value[key], r.value]));
   const cl = byJob(claims, "job_id"), rs = byJob(results, "job_id");
   const cutoff = Date.now() - 24 * 3600 * 1000;
-  const rows = jobs.records.map(r => r.value).filter(s => !(rs[s.id] && rs[s.id].finished_at_ms < cutoff)).sort((a, b) => b.submitted_at_ms - a.submitted_at_ms);
+  const all = jobs.records.map(r => r.value).filter(s => !(rs[s.id] && rs[s.id].finished_at_ms < cutoff)).sort((a, b) => b.submitted_at_ms - a.submitted_at_ms);
+  fillSelect($("fNode"), st.nodes.map(n => [n.facts.node_id, n.facts.name]));
+  fillSelect($("fKind"), [...new Set(all.map(s => s.kind || "job"))].map(k => [k, k]));
+  const fNode = $("fNode").value, fState = $("fState").value, fKind = $("fKind").value, fText = $("fText").value.trim().toLowerCase();
+  const rows = all.filter(s => {
+    const c = cl[s.id], r = rs[s.id];
+    if (fNode && !(c && c.node === fNode) && s.node !== fNode) return false;
+    if (fState && stateOf(s, c, r) !== fState) return false;
+    if (fKind && (s.kind || "job") !== fKind) return false;
+    if (fText && ![s.id, s.cmd.join(" "), s.batch, s.tmux, s.submitted_by].filter(Boolean).some(x => x.toLowerCase().includes(fText))) return false;
+    return true;
+  });
   $("jobs").innerHTML = rows.map(s => {
     const c = cl[s.id], r = rs[s.id];
     const state = stateOf(s, c, r);
@@ -84,12 +104,20 @@ async function render() {
     const target = s.node ? (names[s.node] || s.node) : Object.entries(s.selector || {}).map(([k,v]) => k + "=" + v).join(",") || (s.pick || "any");
     const btn = (!r && !s.cancelled) ? `<button data-id="${esc(s.id)}">cancel</button>` : "";
     return `<tr class="row" data-job="${esc(s.id)}"><td title="${esc(s.id)}">${esc(s.id.slice(0,8))}</td><td>${esc(s.kind || "job")}</td><td class="st ${state}">${state}</td><td>${esc(node)}<div class="sub">${esc(target)}</div></td>
-      <td>${esc(s.tmux || "")}</td><td>${ago(s.submitted_at_ms)} ago<div class="sub">${esc(s.submitted_by)}</div></td><td>${elapsed}</td><td>${esc(exit)}</td><td class="cmd">${esc(s.cmd.join(" "))}</td><td>${btn}</td></tr>`;
+      <td>${esc(s.tmux || "")}${s.batch ? `<div class="sub">batch ${esc(s.batch)}</div>` : ""}${s.retries ? `<div class="sub">retry ${s.retry}/${s.retries}</div>` : ""}</td><td>${ago(s.submitted_at_ms)} ago<div class="sub">${esc(s.submitted_by)}</div></td><td>${elapsed}</td><td>${esc(exit)}</td><td class="cmd">${esc(s.cmd.join(" "))}</td><td>${btn}</td></tr>`;
   }).join("") || `<tr><td colspan="10" class="empty">no jobs</td></tr>`;
   for (const b of document.querySelectorAll("button[data-id]")) b.onclick = (e) => { e.stopPropagation(); cancel(b.dataset.id); };
   for (const tr of document.querySelectorAll("tr.row")) tr.onclick = () => openDrawer(tr.dataset.job);
   if (openId) refreshDrawer();
 }
+function fillSelect(sel, pairs) {
+  const cur = sel.value;
+  const first = sel.options[0].outerHTML;
+  sel.innerHTML = first + pairs.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("");
+  sel.value = cur;
+}
+for (const id of ["fNode", "fState", "fKind"]) $(id).addEventListener("change", schedule);
+$("fText").addEventListener("input", schedule);
 function stateOf(s, c, r) {
   if (r) return (r.error === "cancelled" || (s.cancelled && r.exit_code == null)) ? "cancelled" : r.exit_code === 0 ? "succeeded" : "failed";
   if (s.cancelled) return "cancelled";
@@ -126,6 +154,10 @@ async function refreshDrawer() {
       <dt>claimed by</dt><dd>${c ? esc(names[c.node] || c.node) : "–"}</dd>
       <dt>reason</dt><dd>${esc(s.node ? "pinned to " + (names[s.node] || s.node) : s.pick || (Object.keys(s.selector || {}).length ? "selector " + Object.entries(s.selector).map(([k,v]) => k + "=" + v).join(",") : "any eligible node"))}</dd>
       <dt>session</dt><dd>${esc(s.tmux || "–")}</dd>
+      ${s.batch ? `<dt>batch</dt><dd>${esc(s.batch)}</dd>` : ""}
+      ${s.after && s.after.length ? `<dt>after</dt><dd>${s.after.map(a => esc(a.slice(0,8))).join(", ")}</dd>` : ""}
+      ${s.retries ? `<dt>retries</dt><dd>${s.retry} of ${s.retries} used</dd>` : ""}
+      ${s.cancel_reason ? `<dt>cancelled</dt><dd>${esc(s.cancel_reason)}</dd>` : ""}
       <dt>created</dt><dd>${hms(s.submitted_at_ms)}</dd>
       <dt>claimed</dt><dd>${c ? hms(c.claimed_at_ms) : "–"}</dd>
       <dt>started</dt><dd>${c && c.started_at_ms ? hms(c.started_at_ms) : "–"}</dd>

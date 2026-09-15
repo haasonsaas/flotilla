@@ -298,8 +298,17 @@ enum Outcome {
 async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) -> Outcome {
     let started = flotilla_core::now_ms();
     let log_path = state.cfg.job_log_path(&spec.id);
+    let artifacts = state.cfg.job_artifacts_dir(&spec.id);
+    let _ = tokio::fs::create_dir_all(&artifacts).await;
+    let mut env = spec.env.clone();
+    env.insert(
+        "FLOTILLA_ARTIFACTS".into(),
+        artifacts.to_string_lossy().into_owned(),
+    );
+    env.insert("FLOTILLA_JOB_ID".into(), spec.id.clone());
+    env.insert("FLOTILLA_NODE".into(), state.me.name.clone());
     let req = match &spec.tmux {
-        Some(session) => match tmux_request(state, spec, session, &log_path).await {
+        Some(session) => match tmux_request(state, spec, session, &log_path, &env).await {
             Ok(r) => r,
             Err(e) => {
                 return Outcome::Finished(JobResult {
@@ -316,7 +325,7 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
         None => ExecRequest {
             cmd: wrap_caffeinate(state, spec.cmd.clone()),
             cwd: spec.cwd.clone(),
-            env: spec.env.clone(),
+            env,
             timeout_secs: spec.timeout_secs,
         },
     };
@@ -488,6 +497,7 @@ async fn tmux_request(
     spec: &JobSpec,
     session: &str,
     log_path: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<ExecRequest> {
     let exit_path = tmux_exit_path(state, &spec.id);
     let _ = tokio::fs::remove_file(&exit_path).await;
@@ -515,7 +525,7 @@ async fn tmux_request(
         args.push("-c".into());
         args.push(crate::exec::expand_home(cwd));
     }
-    for (k, v) in &spec.env {
+    for (k, v) in env {
         args.push("-e".into());
         args.push(format!("{k}={v}"));
     }

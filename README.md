@@ -34,6 +34,9 @@ And the layers built on them:
 | batches | `flotilla batch submit -n 6 --then "cargo test --doc" -- cargo test --shard {i}/{n}` | shard a command across the fleet, chain a final job on all shards, `batch wait` |
 | retries | `flotilla job submit --retries 2 -- ...` | failed (not cancelled) jobs are resubmitted with backoff; lost jobs are taken over |
 | notify | `[notify] ntfy_url, topic` in config | push on failed / lost (or any outcome) from the node that ran the job |
+| artifacts | `flotilla job pull 3fa1 ./out` | files a job wrote to `$FLOTILLA_ARTIFACTS`, fetched from the executor through the local daemon |
+| wake-then-run | `flotilla job submit --wake -n mac-mini -- ...` | if no eligible node is online, wake the matching ones and wait |
+| snapshots | `flotilla records dump fleet.json` / `restore fleet.json` | every raw record out to a file and merged back in |
 
 ## Install
 
@@ -178,6 +181,12 @@ apply = ["brew", "install", "jq"]
 3. Each claimant waits one settle window (two sync intervals) and re-reads the claim. Last-writer-wins has picked exactly one record by then; everyone else stands down.
 4. The winner runs the job, streams the log to a local file, and writes `result/<id>` with the exit code and the last 4 KiB of output.
 5. `job show` reads the result from any node. `job logs` fetches the full log from the executor.
+
+Every job gets `FLOTILLA_ARTIFACTS` (a directory on the executor),
+`FLOTILLA_JOB_ID` and `FLOTILLA_NODE` in its environment. Whatever it writes
+under the artifacts directory is listed by `/v1/jobs/{id}/artifacts` and
+downloaded by `flotilla job pull`, and is removed with the job after
+`job_retention_hours`.
 
 Dependencies: `--after <id>` makes a job eligible only once those jobs
 succeeded; if one of them ends any other way, the dependent is cancelled with

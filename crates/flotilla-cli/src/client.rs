@@ -230,6 +230,47 @@ impl Client {
             .boxed())
     }
 
+    pub async fn artifacts(&self, id: &str) -> Result<ArtifactsResponse> {
+        self.get(&format!("/v1/jobs/{id}/artifacts")).await
+    }
+
+    pub async fn artifact(&self, id: &str, path: &str, local: &std::path::Path) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+        let resp = self
+            .http
+            .get(format!("{}/v1/jobs/{id}/artifacts/{path}", self.base))
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await?;
+        let resp = Self::check(resp).await?;
+        if let Some(parent) = local.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        let mut f = tokio::fs::File::create(local)
+            .await
+            .with_context(|| format!("creating {}", local.display()))?;
+        let mut n = 0u64;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            n += chunk.len() as u64;
+            f.write_all(&chunk).await?;
+        }
+        f.flush().await?;
+        Ok(n)
+    }
+
+    pub async fn import(&self, records: Vec<Record>) -> Result<ImportResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/records/import", self.base))
+            .json(&ImportRequest { records })
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
     pub async fn job_log(&self, id: &str) -> Result<Option<String>> {
         let resp = self
             .http

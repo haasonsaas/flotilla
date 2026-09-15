@@ -271,3 +271,31 @@ mod wake_tests {
         assert_eq!(&p[96..], &m);
     }
 }
+
+/// One file a job left in its artifacts directory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    /// Path relative to the job's artifacts directory.
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtifactsResponse {
+    pub job_id: String,
+    pub node: String,
+    pub artifacts: Vec<ArtifactInfo>,
+}
+
+/// Body of `POST /v1/records/import`: raw records to merge (a restore).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportRequest {
+    pub records: Vec<Record>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportResponse {
+    pub applied: usize,
+    pub superseded: usize,
+    pub rejected: usize,
+}
