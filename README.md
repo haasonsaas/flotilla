@@ -98,6 +98,14 @@ Roles: `read` (status, records, events, logs, file downloads), `write`
 `sync` (the peer protocol), `admin` (all). Allow-listed users and tags hold
 every role.
 
+An `app`-only grant like the one above carries no `ip` rule, so it changes
+nothing about reachability; it only shows up in `whois` as a capability. A
+node that needs to sync with its peers must be granted `sync` as well as
+`read`, or the anti-entropy rounds towards it fail with 403. Verified against
+a live tailnet: with `["read", "sync"]` the daemon accepted sync and refused
+`run` and `push` with `403 ... lacks the exec role`; adding `exec` made them
+pass without restarting anything (the whois cache is 20s).
+
 All keys and defaults are in `crates/flotillad/src/config.rs`.
 
 ## Usage
