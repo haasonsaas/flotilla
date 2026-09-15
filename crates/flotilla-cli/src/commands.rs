@@ -1282,3 +1282,263 @@ async fn wait_for_version(client: &Client, old: &str) -> Option<String> {
     }
     client.me().await.ok().map(|m| m.version)
 }
+
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+pub enum SessionCmd {
+    /// List tmux sessions across the fleet (from each node's facts)
+    Ls {
+        /// Only this node
+        #[arg(short = 'n', long = "node")]
+        node: Option<String>,
+    },
+    /// Start a detached tmux session on a node, optionally running a command
+    Start {
+        #[arg(short = 'n', long = "node")]
+        node: String,
+        /// Session name
+        #[arg(long)]
+        name: String,
+        /// Working directory on the node
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Environment KEY=VALUE for the session (repeatable)
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// Command to run in the session (default: the login shell)
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Type text into a session (followed by Enter unless --no-enter)
+    Send {
+        #[arg(short = 'n', long = "node")]
+        node: String,
+        name: String,
+        #[arg(long)]
+        no_enter: bool,
+        #[arg(required = true, last = true)]
+        text: Vec<String>,
+    },
+    /// Print the last lines of a session's active pane
+    Tail {
+        #[arg(short = 'n', long = "node")]
+        node: String,
+        name: String,
+        #[arg(long, default_value_t = 50)]
+        lines: u32,
+    },
+    /// Kill a session
+    Kill {
+        #[arg(short = 'n', long = "node")]
+        node: String,
+        name: String,
+    },
+    /// Attach interactively over SSH (prints the command if ssh fails)
+    Attach {
+        #[arg(short = 'n', long = "node")]
+        node: String,
+        name: String,
+        /// SSH user on the node (default: same as here)
+        #[arg(long)]
+        user: Option<String>,
+    },
+}
+
+async fn find_node(c: &Client, name: &str) -> Result<(StatusResponse, NodeStatus)> {
+    let st = c.status().await?;
+    let n = st
+        .nodes
+        .iter()
+        .find(|n| n.facts.name == name || n.facts.node_id == name)
+        .cloned()
+        .ok_or_else(|| anyhow!("unknown node {name:?}"))?;
+    if !n.online {
+        bail!("{} is offline", n.facts.name);
+    }
+    Ok((st, n))
+}
+
+/// Run a command on a node and collect its output.
+async fn exec_collect(
+    client: &Client,
+    cmd: Vec<String>,
+    env: BTreeMap<String, String>,
+) -> Result<(Option<i32>, String, String)> {
+    let req = ExecRequest {
+        cmd,
+        cwd: None,
+        env,
+        timeout_secs: Some(60),
+    };
+    let mut frames = client.exec(&req).await?;
+    let (mut out, mut err, mut code) = (String::new(), String::new(), None);
+    while let Some(f) = frames.next().await {
+        match f? {
+            ExecFrame::Stdout { data } => out.push_str(&data),
+            ExecFrame::Stderr { data } => err.push_str(&data),
+            ExecFrame::Error { message } => err.push_str(&message),
+            ExecFrame::Exit { code: c } => code = c,
+        }
+    }
+    Ok((code, out, err))
+}
+
+async fn tmux(client: &Client, args: &[&str]) -> Result<String> {
+    let mut cmd = vec!["tmux".to_string()];
+    cmd.extend(args.iter().map(|s| s.to_string()));
+    let (code, out, err) = exec_collect(client, cmd, BTreeMap::new()).await?;
+    if code != Some(0) {
+        bail!(
+            "tmux {} failed: {}",
+            args.first().unwrap_or(&""),
+            err.trim()
+        );
+    }
+    Ok(out)
+}
+
+pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
+    match cmd {
+        SessionCmd::Ls { node } => {
+            let st = c.status().await?;
+            let mut rows = Vec::new();
+            for n in &st.nodes {
+                if let Some(want) = &node {
+                    if &n.facts.name != want && &n.facts.node_id != want {
+                        continue;
+                    }
+                }
+                for s in &n.facts.sessions {
+                    rows.push((n.facts.name.clone(), n.online, s.clone()));
+                }
+            }
+            if json {
+                let v: Vec<serde_json::Value> = rows.iter().map(|(node, online, s)| serde_json::json!({"node": node, "online": online, "session": s})).collect();
+                return print_json(&v);
+            }
+            let mut t = Table::new();
+            t.load_preset(UTF8_FULL_CONDENSED);
+            t.set_header([
+                "node", "session", "running", "windows", "attached", "cwd", "age",
+            ]);
+            for (node, online, s) in rows {
+                t.add_row(vec![
+                    if online {
+                        Cell::new(node)
+                    } else {
+                        Cell::new(node).fg(Color::DarkGrey)
+                    },
+                    Cell::new(&s.name),
+                    Cell::new(&s.command),
+                    Cell::new(s.windows),
+                    Cell::new(if s.attached { "yes" } else { "" }),
+                    Cell::new(&s.cwd),
+                    Cell::new(ms_ago(s.created_ms)),
+                ]);
+            }
+            println!("{t}");
+            Ok(())
+        }
+        SessionCmd::Start {
+            node,
+            name,
+            cwd,
+            env,
+            cmd,
+        } => {
+            let (st, n) = find_node(c, &node).await?;
+            let client = node_url(c, &st, &n)?;
+            let mut args: Vec<String> =
+                vec!["new-session".into(), "-d".into(), "-s".into(), name.clone()];
+            if let Some(d) = &cwd {
+                args.push("-c".into());
+                args.push(d.clone());
+            }
+            for pair in parse_env(&env)? {
+                args.push("-e".into());
+                args.push(format!("{}={}", pair.0, pair.1));
+            }
+            if !cmd.is_empty() {
+                args.push("--".into());
+                args.extend(cmd);
+            }
+            let mut full = vec!["tmux".to_string()];
+            full.extend(args);
+            let (code, _, err) = exec_collect(&client, full, BTreeMap::new()).await?;
+            if code != Some(0) {
+                bail!(
+                    "tmux new-session failed on {}: {}",
+                    n.facts.name,
+                    err.trim()
+                );
+            }
+            println!("started session {name} on {}", n.facts.name);
+            Ok(())
+        }
+        SessionCmd::Send {
+            node,
+            name,
+            no_enter,
+            text,
+        } => {
+            let (st, n) = find_node(c, &node).await?;
+            let client = node_url(c, &st, &n)?;
+            let line = text.join(" ");
+            let mut args = vec!["send-keys", "-t", name.as_str(), line.as_str()];
+            if !no_enter {
+                args.push("Enter");
+            }
+            tmux(&client, &args).await?;
+            Ok(())
+        }
+        SessionCmd::Tail { node, name, lines } => {
+            let (st, n) = find_node(c, &node).await?;
+            let client = node_url(c, &st, &n)?;
+            let start = format!("-{lines}");
+            let out = tmux(
+                &client,
+                &[
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    name.as_str(),
+                    "-S",
+                    start.as_str(),
+                ],
+            )
+            .await?;
+            let trimmed = out.trim_end_matches('\n');
+            println!("{trimmed}");
+            Ok(())
+        }
+        SessionCmd::Kill { node, name } => {
+            let (st, n) = find_node(c, &node).await?;
+            let client = node_url(c, &st, &n)?;
+            tmux(&client, &["kill-session", "-t", name.as_str()]).await?;
+            println!("killed session {name} on {}", n.facts.name);
+            Ok(())
+        }
+        SessionCmd::Attach { node, name, user } => {
+            let (_, n) = find_node(c, &node).await?;
+            let ip = n
+                .facts
+                .tailscale_ips
+                .iter()
+                .find(|s| !s.contains(':'))
+                .or(n.facts.tailscale_ips.first())
+                .ok_or_else(|| anyhow!("node has no address"))?;
+            let target = match user {
+                Some(u) => format!("{u}@{ip}"),
+                None => ip.clone(),
+            };
+            let status = std::process::Command::new("ssh")
+                .args(["-t", &target, "tmux", "attach", "-t", &name])
+                .status();
+            match status {
+                Ok(s) if s.success() => Ok(()),
+                _ => bail!("could not attach; try: ssh -t {target} tmux attach -t {name}"),
+            }
+        }
+    }
+}

@@ -65,6 +65,9 @@ enum Cmd {
     Pull(commands::PullArgs),
     /// Upgrade flotilla on nodes: from the latest GitHub release, or by pushing this machine's binaries
     Upgrade(commands::UpgradeArgs),
+    /// tmux sessions on nodes: long-lived shells and agent sessions you can attach to
+    #[command(subcommand)]
+    Session(commands::SessionCmd),
     /// Remove the user service
     Uninstall,
 }
@@ -91,6 +94,7 @@ async fn main() -> Result<()> {
         Cmd::Push(args) => commands::push(&client, args).await,
         Cmd::Pull(args) => commands::pull(&client, args).await,
         Cmd::Upgrade(args) => commands::upgrade(&client, args).await,
+        Cmd::Session(cmd) => commands::session(&client, cmd, cli.json).await,
         Cmd::Uninstall => install::uninstall().await,
     }
 }

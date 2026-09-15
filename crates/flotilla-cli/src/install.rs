@@ -87,6 +87,30 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// PATH for the daemon: the user's usual tool locations (Nix profiles,
+/// Homebrew, ~/.local/bin) ahead of the system defaults, so exec'd commands
+/// and tmux resolve the same way they do in a terminal.
+fn service_path() -> String {
+    let h = home();
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut dirs: Vec<String> = vec![
+        h.join(".local/bin").to_string_lossy().into_owned(),
+        h.join(".cargo/bin").to_string_lossy().into_owned(),
+        format!("/etc/profiles/per-user/{user}/bin"),
+        h.join(".nix-profile/bin").to_string_lossy().into_owned(),
+        "/nix/var/nix/profiles/default/bin".into(),
+        "/run/current-system/sw/bin".into(),
+        "/opt/homebrew/bin".into(),
+        "/usr/local/bin".into(),
+        "/usr/bin".into(),
+        "/bin".into(),
+        "/usr/sbin".into(),
+        "/sbin".into(),
+    ];
+    dirs.dedup();
+    dirs.join(":")
+}
+
 #[cfg(target_os = "macos")]
 const LABEL: &str = "dev.haasonsaas.flotilla";
 
@@ -113,7 +137,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
   <key>ProcessType</key><string>Background</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>{path}</string>
     <key>RUST_LOG</key><string>info</string>
   </dict>
   <key>StandardOutPath</key><string>{log}</string>
@@ -122,7 +146,8 @@ pub async fn install(args: InstallArgs) -> Result<()> {
 </plist>
 "#,
         daemon = daemon.display(),
-        log = log.display()
+        log = log.display(),
+        path = service_path()
     );
     let path = plist_path();
     std::fs::create_dir_all(path.parent().unwrap())?;
@@ -177,8 +202,9 @@ fn unit_path() -> PathBuf {
 pub async fn install(args: InstallArgs) -> Result<()> {
     let daemon = find_daemon(args.daemon_path)?;
     let unit = format!(
-        "[Unit]\nDescription=flotilla fleet daemon\nAfter=network-online.target tailscaled.service\n\n[Service]\nExecStart={}\nRestart=always\nRestartSec=3\nEnvironment=RUST_LOG=info\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\n\n[Install]\nWantedBy=default.target\n",
-        daemon.display()
+        "[Unit]\nDescription=flotilla fleet daemon\nAfter=network-online.target tailscaled.service\n\n[Service]\nExecStart={}\nRestart=always\nRestartSec=3\nEnvironment=RUST_LOG=info\nEnvironment=PATH={path}\n\n[Install]\nWantedBy=default.target\n",
+        daemon.display(),
+        path = service_path()
     );
     let path = unit_path();
     std::fs::create_dir_all(path.parent().unwrap())?;

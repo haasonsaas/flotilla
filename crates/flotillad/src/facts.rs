@@ -79,10 +79,46 @@ pub fn collect(state: &AppState) -> NodeFacts {
         port: state.cfg.port,
         reported_at_ms: flotilla_core::now_ms(),
         running_jobs: state.running_jobs(),
+        sessions: tmux_sessions(),
         exe_path: std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
     }
+}
+
+/// tmux sessions visible to the daemon's user (same default socket the
+/// user's terminals use). Empty if tmux is absent or no server runs.
+pub fn tmux_sessions() -> Vec<flotilla_core::schema::SessionInfo> {
+    let out = match std::process::Command::new("tmux")
+        .args([
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{pane_current_path}\t#{pane_current_command}",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Vec::new(),
+    };
+    out.lines().filter_map(parse_tmux_line).collect()
+}
+
+fn parse_tmux_line(line: &str) -> Option<flotilla_core::schema::SessionInfo> {
+    let mut f = line.split('\t');
+    let name = f.next()?.to_string();
+    let created_ms = f.next()?.parse::<u64>().ok()? * 1000;
+    let windows = f.next()?.parse().ok()?;
+    let attached = f.next()?.parse::<u32>().map(|n| n > 0).unwrap_or(false);
+    let cwd = f.next().unwrap_or("").to_string();
+    let command = f.next().unwrap_or("").to_string();
+    Some(flotilla_core::schema::SessionInfo {
+        name,
+        created_ms,
+        windows,
+        attached,
+        cwd,
+        command,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -142,6 +178,23 @@ fn battery() -> (Option<u8>, Option<bool>) {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn battery() -> (Option<u8>, Option<bool>) {
     (None, None)
+}
+
+#[cfg(test)]
+mod tmux_tests {
+    use super::*;
+
+    #[test]
+    fn parses_list_sessions_line() {
+        let s = parse_tmux_line("work\t1700000000\t3\t1\t/home/me/proj\tclaude").unwrap();
+        assert_eq!(s.name, "work");
+        assert_eq!(s.created_ms, 1_700_000_000_000);
+        assert_eq!(s.windows, 3);
+        assert!(s.attached);
+        assert_eq!(s.cwd, "/home/me/proj");
+        assert_eq!(s.command, "claude");
+        assert!(parse_tmux_line("garbage").is_none());
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

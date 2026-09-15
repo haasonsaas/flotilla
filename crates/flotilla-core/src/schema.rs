@@ -34,6 +34,23 @@ pub struct NodeFacts {
     /// Where flotillad is running from, so `flotilla upgrade` knows what to replace.
     #[serde(default)]
     pub exe_path: String,
+    /// tmux sessions on this node, for the sessions layer.
+    #[serde(default)]
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// A tmux session as seen on a node.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub name: String,
+    pub created_ms: u64,
+    pub windows: u32,
+    pub attached: bool,
+    #[serde(default)]
+    pub cwd: String,
+    /// Command running in the active pane.
+    #[serde(default)]
+    pub command: String,
 }
 
 /// `job/<id>`: written by the submitter.
