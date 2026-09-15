@@ -247,6 +247,9 @@ async fn job_is_claimed_run_on_selected_node_and_result_replicates() {
         submitted_at_ms: flotilla_core::now_ms(),
         timeout_secs: Some(30),
         cancelled: false,
+        pick: None,
+        tmux: None,
+        kind: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
 
@@ -314,6 +317,9 @@ async fn job_cancel_kills_running_process() {
         submitted_at_ms: flotilla_core::now_ms(),
         timeout_secs: None,
         cancelled: false,
+        pick: None,
+        tmux: None,
+        kind: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("job running", || {
@@ -421,6 +427,9 @@ async fn expired_lease_is_taken_over() {
         submitted_at_ms: flotilla_core::now_ms(),
         timeout_secs: Some(30),
         cancelled: false,
+        pick: None,
+        tmux: None,
+        kind: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     // A claim from a node that died: lease already in the past.
@@ -486,6 +495,9 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
         submitted_at_ms: flotilla_core::now_ms(),
         timeout_secs: None,
         cancelled: false,
+        pick: None,
+        tmux: None,
+        kind: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -570,6 +582,9 @@ async fn gc_retires_old_jobs_and_keeps_recent() {
             submitted_at_ms: finished - 1000,
             timeout_secs: None,
             cancelled: false,
+            pick: None,
+            tmux: None,
+            kind: None,
         };
         let result = JobResult {
             job_id: id.into(),
@@ -734,6 +749,9 @@ async fn gc_keeps_cancelled_job_while_its_lease_is_live() {
         submitted_at_ms: now - retention_ms - 60_000,
         timeout_secs: None,
         cancelled: true,
+        pick: None,
+        tmux: None,
+        kind: None,
     };
     a.state.store.put_json(&keys::job("long"), &spec).unwrap();
     let claim = JobClaim {
@@ -781,6 +799,9 @@ async fn shutdown_leaves_claim_and_writes_no_result() {
         submitted_at_ms: flotilla_core::now_ms(),
         timeout_secs: None,
         cancelled: false,
+        pick: None,
+        tmux: None,
+        kind: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -814,5 +835,166 @@ async fn shutdown_leaves_claim_and_writes_no_result() {
         .parse()
         .unwrap();
     assert_eq!(claim.node, "id-solo", "claim kept for resume/takeover");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+fn spec_for(id: &str, cmd: &[&str]) -> JobSpec {
+    JobSpec {
+        id: id.into(),
+        cmd: cmd.iter().map(|s| s.to_string()).collect(),
+        cwd: None,
+        env: Default::default(),
+        selector: Default::default(),
+        node: None,
+        submitted_by: "test".into(),
+        submitted_at_ms: flotilla_core::now_ms(),
+        timeout_secs: Some(60),
+        cancelled: false,
+        pick: None,
+        tmux: None,
+        kind: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn least_load_defers_to_a_less_loaded_peer() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    // A fresh, idle peer that matches the (empty) selector.
+    let mut other = a.state.my_facts().unwrap();
+    other.node_id = "id-idle".into();
+    other.name = "idle".into();
+    other.load_1m = 0.0;
+    other.cpus = 64;
+    other.reported_at_ms = flotilla_core::now_ms();
+    a.state
+        .store
+        .put_json(&keys::node_facts("id-idle"), &other)
+        .unwrap();
+    let mut spec = spec_for(&uuid::Uuid::new_v4().to_string(), &["true"]);
+    spec.pick = Some("least-load".into());
+    a.state.store.put_json(&keys::job(&spec.id), &spec).unwrap();
+    pause(Duration::from_secs(4)).await;
+    assert!(
+        a.state.store.get(&keys::claim(&spec.id)).unwrap().is_none(),
+        "must leave it to the idle peer"
+    );
+    // The peer goes quiet (stale facts) -> we are the only fresh candidate.
+    other.reported_at_ms = 1;
+    a.state
+        .store
+        .put_json(&keys::node_facts("id-idle"), &other)
+        .unwrap();
+    eventually("claimed once the peer is stale", || {
+        a.state.store.get(&keys::claim(&spec.id)).unwrap().is_some()
+    })
+    .await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+fn has_tmux() -> bool {
+    std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tmux_job_runs_in_a_session_with_log_and_exit_code() {
+    if !has_tmux() {
+        eprintln!("tmux not installed; skipping");
+        return;
+    }
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let session = format!("flt-test-{}", &id[..8]);
+    let mut spec = spec_for(&id, &["sh", "-c", "echo in tmux $FLT; pwd; exit 3"]);
+    spec.node = Some("solo".into());
+    spec.tmux = Some(session.clone());
+    spec.cwd = Some("/tmp".into());
+    spec.env.insert("FLT".into(), "yes".into());
+    a.state.store.put_json(&keys::job(&id), &spec).unwrap();
+    eventually("result", || {
+        a.state.store.get(&keys::result(&id)).unwrap().is_some()
+    })
+    .await;
+    let r: JobResult = a
+        .state
+        .store
+        .get(&keys::result(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(r.exit_code, Some(3), "{r:?}");
+    assert!(r.output_tail.contains("in tmux yes"), "{r:?}");
+    assert!(
+        r.output_tail.contains("/tmp") || r.output_tail.contains("/private/tmp"),
+        "{r:?}"
+    );
+    let log = std::fs::read_to_string(a.state.cfg.job_log_path(&id)).unwrap();
+    assert!(log.contains("in tmux yes"));
+    let alive = std::process::Command::new("tmux")
+        .args(["has-session", "-t", &session])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(!alive, "session should be gone after exit");
+    assert!(!a.state.cfg.jobs_dir().join(format!("{id}.exit")).exists());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_tmux_job_kills_the_session() {
+    if !has_tmux() {
+        return;
+    }
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let session = format!("flt-test-{}", &id[..8]);
+    let mut spec = spec_for(&id, &["tail", "-f", "/dev/null"]);
+    spec.node = Some("solo".into());
+    spec.tmux = Some(session.clone());
+    spec.timeout_secs = None;
+    a.state.store.put_json(&keys::job(&id), &spec).unwrap();
+    eventually("session up", || {
+        std::process::Command::new("tmux")
+            .args(["has-session", "-t", &session])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+    .await;
+    spec.cancelled = true;
+    a.state.store.put_json(&keys::job(&id), &spec).unwrap();
+    eventually("result", || {
+        a.state.store.get(&keys::result(&id)).unwrap().is_some()
+    })
+    .await;
+    let r: JobResult = a
+        .state
+        .store
+        .get(&keys::result(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(r.exit_code, None);
+    assert_eq!(r.error.as_deref(), Some("cancelled"));
+    let alive = std::process::Command::new("tmux")
+        .args(["has-session", "-t", &session])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(!alive, "session must be killed on cancel");
     std::fs::remove_dir_all(dir).ok();
 }

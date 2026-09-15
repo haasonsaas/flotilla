@@ -463,6 +463,12 @@ pub struct SubmitArgs {
     /// Wait for completion and stream the result
     #[arg(long)]
     wait: bool,
+    /// Placement: `least-load` picks the least loaded eligible node
+    #[arg(long)]
+    pick: Option<String>,
+    /// Run inside a detached tmux session of this name on the executor
+    #[arg(long)]
+    tmux: Option<String>,
     #[arg(required = true, last = true)]
     cmd: Vec<String>,
 }
@@ -568,6 +574,9 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
                 submitted_at_ms: flotilla_core::now_ms(),
                 timeout_secs: a.timeout,
                 cancelled: false,
+                pick: a.pick,
+                tmux: a.tmux,
+                kind: None,
             };
             c.put_json(&keys::job(&spec.id), &spec).await?;
             if json && !a.wait {
@@ -1640,4 +1649,225 @@ pub async fn wake(c: &Client, node: &str) -> Result<()> {
     }
     println!("sent; {} should show online in `flotilla status` within a minute if wake-on-LAN is enabled on it", target.facts.name);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCmd {
+    /// Run an agent command as a job inside a tmux session on the fleet
+    Run(AgentRunArgs),
+    /// List agent runs across the fleet
+    Ls,
+    /// Full log of an agent run (from the node that ran it)
+    Logs { id: String },
+    /// Attach to a running agent's tmux session over SSH
+    Attach {
+        id: String,
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Stop an agent run
+    Stop { id: String },
+}
+
+#[derive(Args, Debug)]
+pub struct AgentRunArgs {
+    /// Pin to one node by name or id
+    #[arg(short = 'n', long = "node")]
+    node: Option<String>,
+    /// Only nodes whose labels match may claim it, e.g. os=linux
+    #[arg(short = 'l', long = "selector")]
+    selector: Option<Selector>,
+    /// Placement (default least-load): least-load | any
+    #[arg(long, default_value = "least-load")]
+    pick: String,
+    /// tmux session name on the executor (default: agent-<id prefix>)
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    cwd: Option<String>,
+    #[arg(short = 'e', long = "env")]
+    env: Vec<String>,
+    #[arg(long)]
+    timeout: Option<u64>,
+    /// Wait for completion and print the output tail
+    #[arg(long)]
+    wait: bool,
+    #[arg(required = true, last = true)]
+    cmd: Vec<String>,
+}
+
+pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
+    match cmd {
+        AgentCmd::Run(a) => {
+            let me = c.me().await?;
+            let node = match &a.node {
+                Some(n) => Some(resolve_node(c, n).await?.0),
+                None => None,
+            };
+            let id = uuid::Uuid::new_v4().to_string();
+            let name = a
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("agent-{}", &id[..8]));
+            let spec = JobSpec {
+                id: id.clone(),
+                cmd: a.cmd,
+                cwd: a.cwd,
+                env: parse_env(&a.env)?,
+                selector: a.selector.unwrap_or_default(),
+                node,
+                submitted_by: me.name,
+                submitted_at_ms: flotilla_core::now_ms(),
+                timeout_secs: a.timeout,
+                cancelled: false,
+                pick: if a.pick == "any" { None } else { Some(a.pick) },
+                tmux: Some(name.clone()),
+                kind: Some("agent".into()),
+            };
+            c.put_json(&keys::job(&id), &spec).await?;
+            if json && !a.wait {
+                return print_json(&spec);
+            }
+            println!(
+                "{id}  (tmux session {name}; `flotilla agent attach {}` once claimed)",
+                &id[..8]
+            );
+            if a.wait {
+                return wait(c, &id, json).await;
+            }
+            Ok(())
+        }
+        AgentCmd::Ls => {
+            let names = node_names(c).await?;
+            let jobs: Vec<JobView> = load_jobs(c)
+                .await?
+                .into_iter()
+                .filter(|j| j.spec.kind.as_deref() == Some("agent"))
+                .collect();
+            if json {
+                let v: Vec<serde_json::Value> = jobs.iter().map(|j| serde_json::json!({"spec": j.spec, "claim": j.claim, "result": j.result, "state": j.state})).collect();
+                return print_json(&v);
+            }
+            let st = c.status().await?;
+            let mut t = Table::new();
+            t.load_preset(UTF8_FULL_CONDENSED);
+            t.set_header([
+                "id",
+                "state",
+                "node",
+                "session",
+                "started",
+                "elapsed",
+                "last line",
+                "cmd",
+            ]);
+            for j in jobs {
+                let node_id = j.claim.as_ref().map(|c| c.node.clone());
+                let node = node_id
+                    .as_ref()
+                    .map(|n| names.get(n).cloned().unwrap_or_else(|| n.clone()))
+                    .unwrap_or_default();
+                let (started, elapsed) = match (&j.claim, &j.result) {
+                    (Some(cl), Some(r)) => (
+                        ms_ago(cl.claimed_at_ms) + " ago",
+                        format!(
+                            "{}s",
+                            r.finished_at_ms.saturating_sub(r.started_at_ms) / 1000
+                        ),
+                    ),
+                    (Some(cl), None) => {
+                        (ms_ago(cl.claimed_at_ms) + " ago", ms_ago(cl.claimed_at_ms))
+                    }
+                    _ => (String::new(), String::new()),
+                };
+                let last = match (&j.state, &j.result, &node_id) {
+                    (_, Some(r), _) => r.output_tail.lines().last().unwrap_or("").to_string(),
+                    (JobState::Claimed, None, Some(nid)) => {
+                        // live: peek at the session's pane on the executor
+                        match st
+                            .nodes
+                            .iter()
+                            .find(|n| &n.facts.node_id == nid)
+                            .and_then(|n| node_url(c, &st, n).ok())
+                        {
+                            Some(client) => tmux(
+                                &client,
+                                &[
+                                    "capture-pane",
+                                    "-p",
+                                    "-t",
+                                    j.spec.tmux.as_deref().unwrap_or(""),
+                                    "-S",
+                                    "-5",
+                                ],
+                            )
+                            .await
+                            .ok()
+                            .and_then(|o| {
+                                o.lines()
+                                    .rev()
+                                    .find(|l| !l.trim().is_empty())
+                                    .map(String::from)
+                            })
+                            .unwrap_or_default(),
+                            None => String::new(),
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let state_cell = match j.state {
+                    JobState::Succeeded => Cell::new("done").fg(Color::Green),
+                    JobState::Failed => Cell::new("failed").fg(Color::Red),
+                    JobState::Claimed => Cell::new("running").fg(Color::Yellow),
+                    JobState::Orphaned => Cell::new("orphaned").fg(Color::Red),
+                    JobState::Pending => Cell::new("queued"),
+                    JobState::Cancelled => Cell::new("stopped").fg(Color::DarkGrey),
+                };
+                let last: String = last.chars().take(60).collect();
+                t.add_row(vec![
+                    Cell::new(&j.spec.id[..8]),
+                    state_cell,
+                    Cell::new(node),
+                    Cell::new(j.spec.tmux.clone().unwrap_or_default()),
+                    Cell::new(started),
+                    Cell::new(elapsed),
+                    Cell::new(last),
+                    Cell::new(
+                        shell_words(&j.spec.cmd)
+                            .chars()
+                            .take(50)
+                            .collect::<String>(),
+                    ),
+                ]);
+            }
+            println!("{t}");
+            Ok(())
+        }
+        AgentCmd::Logs { id } => job(c, JobCmd::Logs { id }, json).await,
+        AgentCmd::Attach { id, user } => {
+            let id = resolve_job(c, &id).await?;
+            let spec: JobSpec = c
+                .get_record(&keys::job(&id))
+                .await?
+                .ok_or_else(|| anyhow!("no such job"))?
+                .parse()?;
+            let claim: JobClaim = c
+                .get_record(&keys::claim(&id))
+                .await?
+                .ok_or_else(|| anyhow!("not claimed yet"))?
+                .parse()?;
+            let names = node_names(c).await?;
+            let node = names
+                .get(&claim.node)
+                .cloned()
+                .unwrap_or(claim.node.clone());
+            let name = spec
+                .tmux
+                .ok_or_else(|| anyhow!("job has no tmux session"))?;
+            session(c, SessionCmd::Attach { node, name, user }, json).await
+        }
+        AgentCmd::Stop { id } => job(c, JobCmd::Cancel { id }, json).await,
+    }
 }

@@ -70,6 +70,9 @@ enum Cmd {
     Session(commands::SessionCmd),
     /// Send wake-on-LAN for an offline node from every online node on its LAN
     Wake { node: String },
+    /// Agent runs: jobs that execute inside tmux sessions on the least loaded node
+    #[command(subcommand)]
+    Agent(commands::AgentCmd),
     /// Remove the user service
     Uninstall,
 }
@@ -98,6 +101,7 @@ async fn main() -> Result<()> {
         Cmd::Upgrade(args) => commands::upgrade(&client, args).await,
         Cmd::Session(cmd) => commands::session(&client, cmd, cli.json).await,
         Cmd::Wake { node } => commands::wake(&client, &node).await,
+        Cmd::Agent(cmd) => commands::agent(&client, cmd, cli.json).await,
         Cmd::Uninstall => install::uninstall().await,
     }
 }

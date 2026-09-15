@@ -63,6 +63,15 @@ fn write_claim(state: &AppState, id: &str, attempt: u32) -> anyhow::Result<JobCl
 }
 
 async fn tick(state: &AppState) -> anyhow::Result<()> {
+    // Once shutdown has started, never claim or resume anything: a job we
+    // just killed must stay unclaimed-by-us until the restarted daemon (or a
+    // peer) picks it up.
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(());
+    }
     let Some(facts) = state.my_facts() else {
         return Ok(());
     };
@@ -90,6 +99,15 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         let has_capacity = state.running.lock().unwrap().len() < state.cfg.max_concurrent_jobs;
+        // Placement hint: with `least-load`, only the least loaded eligible
+        // node (by the facts everyone replicates) claims. Ties break on node
+        // id, and LWW on the claim still resolves any disagreement.
+        if spec.node.is_none()
+            && spec.pick.as_deref() == Some("least-load")
+            && !least_loaded(state, &spec, &facts)
+        {
+            continue;
+        }
         match current_claim(state, &spec.id) {
             Some(claim) if claim.node == state.me.node_id => {
                 // Ours (e.g. after a restart) but not running: resume it.
@@ -174,17 +192,37 @@ enum Outcome {
 
 async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) -> Outcome {
     let started = flotilla_core::now_ms();
-    let req = ExecRequest {
-        cmd: wrap_caffeinate(state, spec.cmd.clone()),
-        cwd: spec.cwd.clone(),
-        env: spec.env.clone(),
-        timeout_secs: spec.timeout_secs,
+    let log_path = state.cfg.job_log_path(&spec.id);
+    let req = match &spec.tmux {
+        Some(session) => match tmux_request(state, spec, session, &log_path).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Outcome::Finished(JobResult {
+                    job_id: spec.id.clone(),
+                    node: state.me.node_id.clone(),
+                    exit_code: None,
+                    started_at_ms: started,
+                    finished_at_ms: flotilla_core::now_ms(),
+                    output_tail: String::new(),
+                    error: Some(format!("tmux session: {e:#}")),
+                })
+            }
+        },
+        None => ExecRequest {
+            cmd: wrap_caffeinate(state, spec.cmd.clone()),
+            cwd: spec.cwd.clone(),
+            env: spec.env.clone(),
+            timeout_secs: spec.timeout_secs,
+        },
     };
     let mut rx = exec::spawn(req, cancel.clone());
     let mut tail = Tail::new(TAIL_BYTES);
-    let mut log = tokio::fs::File::create(state.cfg.job_log_path(&spec.id))
-        .await
-        .ok();
+    // In tmux mode the session's shell writes the log itself.
+    let mut log = if spec.tmux.is_some() {
+        None
+    } else {
+        tokio::fs::File::create(&log_path).await.ok()
+    };
     let mut exit = None;
     let mut error = None;
 
@@ -244,8 +282,33 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
     if let Some(f) = log.as_mut() {
         let _ = f.flush().await;
     }
-    if let Some(to) = lost.lock().unwrap().take() {
+    let lost_to = lost.lock().unwrap().take();
+    if let Some(to) = lost_to {
+        if let Some(session) = &spec.tmux {
+            tmux_kill(session).await;
+        }
         return Outcome::LostOwnership(to);
+    }
+    if let Some(session) = &spec.tmux {
+        // The waiter exited: either the session finished (exit file present)
+        // or we were cancelled / timed out and must tear the session down.
+        let exit_path = tmux_exit_path(state, &spec.id);
+        match tokio::fs::read_to_string(&exit_path).await {
+            Ok(code) => exit = code.trim().parse().ok(),
+            Err(_) => {
+                tmux_kill(session).await;
+                exit = None;
+                if error.is_none() {
+                    error = Some("session ended without an exit status".into());
+                }
+            }
+        }
+        let _ = tokio::fs::remove_file(&exit_path).await;
+        let mut t = Tail::new(TAIL_BYTES);
+        if let Ok(text) = tokio::fs::read_to_string(&log_path).await {
+            t.push(&text);
+        }
+        tail = t;
     }
     Outcome::Finished(JobResult {
         job_id: spec.id.clone(),
@@ -273,4 +336,107 @@ fn wrap_caffeinate(state: &AppState, cmd: Vec<String>) -> Vec<String> {
     let mut wrapped = vec!["caffeinate".to_string(), "-i".to_string()];
     wrapped.extend(cmd);
     wrapped
+}
+
+/// True if this node is the least loaded (load per cpu) among the nodes
+/// whose facts are fresh and whose labels match the job's selector.
+fn least_loaded(state: &AppState, spec: &JobSpec, mine: &flotilla_core::schema::NodeFacts) -> bool {
+    let now = flotilla_core::now_ms();
+    let fresh_ms = state.cfg.facts_interval_secs * 4 * 1000;
+    let score = |f: &flotilla_core::schema::NodeFacts| f.load_1m / f.cpus.max(1) as f64;
+    let my_score = score(mine);
+    let Ok(records) = state.store.list(keys::NODE) else {
+        return true;
+    };
+    for rec in records {
+        let Ok(other) = rec.parse::<flotilla_core::schema::NodeFacts>() else {
+            continue;
+        };
+        if other.node_id == mine.node_id || now.saturating_sub(other.reported_at_ms) > fresh_ms {
+            continue;
+        }
+        if !spec.selector.matches(&other.labels) {
+            continue;
+        }
+        let s = score(&other);
+        if s < my_score || (s == my_score && other.node_id < mine.node_id) {
+            return false;
+        }
+    }
+    true
+}
+
+fn tmux_exit_path(state: &AppState, id: &str) -> std::path::PathBuf {
+    state.cfg.jobs_dir().join(format!("{id}.exit"))
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Start the job inside a detached tmux session whose shell writes the log
+/// and exit status to files and then signals a tmux wait channel. The
+/// returned request is the waiter for that channel; killing it (cancel or
+/// timeout) is followed by killing the session.
+async fn tmux_request(
+    state: &AppState,
+    spec: &JobSpec,
+    session: &str,
+    log_path: &std::path::Path,
+) -> anyhow::Result<ExecRequest> {
+    let exit_path = tmux_exit_path(state, &spec.id);
+    let _ = tokio::fs::remove_file(&exit_path).await;
+    let chan = format!("flotilla-{}", spec.id);
+    let cmd: Vec<String> = wrap_caffeinate(state, spec.cmd.clone())
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect();
+    let inner = format!(
+        "exec > {log} 2>&1; {cmd}; code=$?; echo $code > {exit}; tmux wait-for -S {chan}",
+        log = shell_quote(&log_path.to_string_lossy()),
+        cmd = cmd.join(" "),
+        exit = shell_quote(&exit_path.to_string_lossy()),
+        chan = chan,
+    );
+    let mut args: Vec<String> = vec![
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        session.into(),
+    ];
+    if let Some(cwd) = &spec.cwd {
+        args.push("-c".into());
+        args.push(crate::exec::expand_home(cwd));
+    }
+    for (k, v) in &spec.env {
+        args.push("-e".into());
+        args.push(format!("{k}={v}"));
+    }
+    args.push("--".into());
+    args.push("sh".into());
+    args.push("-c".into());
+    args.push(inner);
+    let out = tokio::process::Command::new("tmux")
+        .args(&args)
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(ExecRequest {
+        cmd: vec!["tmux".into(), "wait-for".into(), chan],
+        cwd: None,
+        env: Default::default(),
+        timeout_secs: spec.timeout_secs,
+    })
+}
+
+async fn tmux_kill(session: &str) {
+    let _ = tokio::process::Command::new("tmux")
+        .args(["kill-session", "-t", session])
+        .output()
+        .await;
 }

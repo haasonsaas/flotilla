@@ -86,6 +86,17 @@ pub struct JobSpec {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub cancelled: bool,
+    /// Placement hint: `least-load` lets only the eligible node with the
+    /// lowest load-per-cpu claim the job. Default: any eligible node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
+    /// Run inside a detached tmux session of this name on the executor, so
+    /// it can be attached to while it runs. Output still goes to the job log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<String>,
+    /// Free-form kind for listing, e.g. `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// `claim/<id>`: written by a node that intends to run the job.
@@ -227,6 +238,9 @@ mod tests {
             submitted_at_ms: 0,
             timeout_secs: None,
             cancelled: false,
+            pick: None,
+            tmux: None,
+            kind: None,
         }
     }
 

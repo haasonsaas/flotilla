@@ -344,7 +344,11 @@ async fn post_sync_now(
                 })
                 .collect()
         }
-        None => all,
+        // bare form: known fleet members and configured seeds only
+        None => all
+            .into_iter()
+            .filter(|c| c.known || c.name.starts_with("seed "))
+            .collect(),
     };
     let mut out = Vec::new();
     for c in &selected {
