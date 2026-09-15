@@ -41,6 +41,8 @@ pub struct Config {
     pub facts_interval_secs: u64,
     pub scheduler_interval_secs: u64,
     pub reconcile_interval_secs: u64,
+    /// Optional push notifications (ntfy) for job outcomes on this node.
+    pub notify: Option<NotifyConfig>,
     /// Extra listen addresses (host:port). Loopback and Tailscale IPs are always bound.
     pub listen: Vec<String>,
     /// Peers to sync with that may not be discoverable yet or that listen on a
@@ -50,6 +52,25 @@ pub struct Config {
     /// "tailscale" (default) or "static" (tests).
     pub identity: String,
     pub static_identity: Option<StaticIdentityConfig>,
+}
+
+/// `[notify]`: POST a line to an ntfy topic when a job this node ran
+/// finishes, and when this node takes over a lost job.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    /// e.g. `https://ntfy.sh` or `http://ntfy:80`
+    pub ntfy_url: String,
+    pub topic: String,
+    /// Which outcomes to send: any of succeeded, failed, cancelled, lost. Default: failed, lost.
+    #[serde(default = "default_notify_on")]
+    pub on: Vec<String>,
+    /// Optional bearer/basic token for the ntfy server.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+fn default_notify_on() -> Vec<String> {
+    vec!["failed".into(), "lost".into()]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +119,7 @@ impl Default for Config {
             facts_interval_secs: 15,
             scheduler_interval_secs: 3,
             reconcile_interval_secs: 60,
+            notify: None,
             listen: Vec::new(),
             seeds: Vec::new(),
             identity: "tailscale".into(),

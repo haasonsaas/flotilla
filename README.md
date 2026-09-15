@@ -31,6 +31,9 @@ And the layers built on them:
 | wake | `flotilla wake mac-mini` | wake-on-LAN sent from every online node on that LAN |
 | agents | `flotilla agent run -l os=linux --cwd ~/proj -- grok -p "fix the tests"` | a job that runs inside a tmux session on the least loaded node; `agent ls/attach/logs/stop` |
 | dashboard | `open http://127.0.0.1:7400/` | live nodes and jobs page served by every daemon, refreshed from the event stream |
+| batches | `flotilla batch submit -n 6 --then "cargo test --doc" -- cargo test --shard {i}/{n}` | shard a command across the fleet, chain a final job on all shards, `batch wait` |
+| retries | `flotilla job submit --retries 2 -- ...` | failed (not cancelled) jobs are resubmitted with backoff; lost jobs are taken over |
+| notify | `[notify] ntfy_url, topic` in config | push on failed / lost (or any outcome) from the node that ran the job |
 
 ## Install
 
@@ -175,6 +178,13 @@ apply = ["brew", "install", "jq"]
 3. Each claimant waits one settle window (two sync intervals) and re-reads the claim. Last-writer-wins has picked exactly one record by then; everyone else stands down.
 4. The winner runs the job, streams the log to a local file, and writes `result/<id>` with the exit code and the last 4 KiB of output.
 5. `job show` reads the result from any node. `job logs` fetches the full log from the executor.
+
+Dependencies: `--after <id>` makes a job eligible only once those jobs
+succeeded; if one of them ends any other way, the dependent is cancelled with
+a reason. `--retries N` clears a failed result after 10s, 20s, 40s ... and
+lets the job be claimed again; a cancelled job is never retried. Batches are
+just a label plus `{i}`/`{n}` substitution, and `--then` submits one more job
+depending on every shard.
 
 Job states, derived from the replicated records rather than stored:
 

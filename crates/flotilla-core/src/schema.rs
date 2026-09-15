@@ -97,6 +97,23 @@ pub struct JobSpec {
     /// Free-form kind for listing, e.g. `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Jobs that must have succeeded before this one is eligible. If any of
+    /// them ends without success, this job is cancelled with a reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Batch label for grouping (`flotilla batch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<String>,
+    /// Automatic resubmissions after a failed result (not cancels).
+    #[serde(default)]
+    pub retries: u32,
+    /// How many retries have been used. Bumped when the failed result is
+    /// cleared for another attempt.
+    #[serde(default)]
+    pub retry: u32,
+    /// Why the job was cancelled, when the fleet did it (dependency failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<String>,
 }
 
 /// `claim/<id>`: written by a node that intends to run the job.
@@ -274,6 +291,11 @@ mod tests {
             pick: None,
             tmux: None,
             kind: None,
+            after: Vec::new(),
+            batch: None,
+            retries: 0,
+            retry: 0,
+            cancel_reason: None,
         }
     }
 

@@ -250,6 +250,11 @@ async fn job_is_claimed_run_on_selected_node_and_result_replicates() {
         pick: None,
         tmux: None,
         kind: None,
+        after: Vec::new(),
+        batch: None,
+        retries: 0,
+        retry: 0,
+        cancel_reason: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
 
@@ -320,6 +325,11 @@ async fn job_cancel_kills_running_process() {
         pick: None,
         tmux: None,
         kind: None,
+        after: Vec::new(),
+        batch: None,
+        retries: 0,
+        retry: 0,
+        cancel_reason: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("job running", || {
@@ -430,6 +440,11 @@ async fn expired_lease_is_taken_over() {
         pick: None,
         tmux: None,
         kind: None,
+        after: Vec::new(),
+        batch: None,
+        retries: 0,
+        retry: 0,
+        cancel_reason: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     // A claim from a node that died: lease already in the past.
@@ -499,6 +514,11 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
         pick: None,
         tmux: None,
         kind: None,
+        after: Vec::new(),
+        batch: None,
+        retries: 0,
+        retry: 0,
+        cancel_reason: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -605,6 +625,11 @@ async fn gc_retires_old_jobs_and_keeps_recent() {
             pick: None,
             tmux: None,
             kind: None,
+            after: Vec::new(),
+            batch: None,
+            retries: 0,
+            retry: 0,
+            cancel_reason: None,
         };
         let result = JobResult {
             job_id: id.into(),
@@ -772,6 +797,11 @@ async fn gc_keeps_cancelled_job_while_its_lease_is_live() {
         pick: None,
         tmux: None,
         kind: None,
+        after: Vec::new(),
+        batch: None,
+        retries: 0,
+        retry: 0,
+        cancel_reason: None,
     };
     a.state.store.put_json(&keys::job("long"), &spec).unwrap();
     let claim = JobClaim {
@@ -823,6 +853,11 @@ async fn shutdown_leaves_claim_and_writes_no_result() {
         pick: None,
         tmux: None,
         kind: None,
+        after: Vec::new(),
+        batch: None,
+        retries: 0,
+        retry: 0,
+        cancel_reason: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -874,6 +909,11 @@ fn spec_for(id: &str, cmd: &[&str]) -> JobSpec {
         pick: None,
         tmux: None,
         kind: None,
+        after: Vec::new(),
+        batch: None,
+        retries: 0,
+        retry: 0,
+        cancel_reason: None,
     }
 }
 
@@ -1033,5 +1073,142 @@ async fn dashboard_is_served() {
         .starts_with("text/html"));
     let body = resp.text().await.unwrap();
     assert!(body.contains("/v1/events") && body.contains("<title>flotilla</title>"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dependency_gates_and_failure_cancels_dependents() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    // first -> second (ok chain); bad -> doomed (failure propagates)
+    let mut first = spec_for(&uuid::Uuid::new_v4().to_string(), &["sh", "-c", "echo one"]);
+    first.node = Some("solo".into());
+    let mut second = spec_for(&uuid::Uuid::new_v4().to_string(), &["sh", "-c", "echo two"]);
+    second.node = Some("solo".into());
+    second.after = vec![first.id.clone()];
+    let mut bad = spec_for(&uuid::Uuid::new_v4().to_string(), &["sh", "-c", "exit 7"]);
+    bad.node = Some("solo".into());
+    let mut doomed = spec_for(&uuid::Uuid::new_v4().to_string(), &["true"]);
+    doomed.node = Some("solo".into());
+    doomed.after = vec![bad.id.clone()];
+    for sp in [&second, &doomed, &first, &bad] {
+        a.state.store.put_json(&keys::job(&sp.id), sp).unwrap();
+    }
+    eventually("second finished", || {
+        a.state
+            .store
+            .get(&keys::result(&second.id))
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let r1: JobResult = a
+        .state
+        .store
+        .get(&keys::result(&first.id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let r2: JobResult = a
+        .state
+        .store
+        .get(&keys::result(&second.id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        r2.started_at_ms >= r1.finished_at_ms,
+        "second must not start before first finished"
+    );
+    eventually("doomed cancelled", || {
+        a.state
+            .store
+            .get(&keys::job(&doomed.id))
+            .unwrap()
+            .and_then(|r| r.parse::<JobSpec>().ok())
+            .map(|s| s.cancelled)
+            .unwrap_or(false)
+    })
+    .await;
+    let d: JobSpec = a
+        .state
+        .store
+        .get(&keys::job(&doomed.id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        d.cancel_reason.as_deref().unwrap_or("").contains("failed"),
+        "{d:?}"
+    );
+    assert!(
+        a.state
+            .store
+            .get(&keys::claim(&doomed.id))
+            .unwrap()
+            .is_none(),
+        "never ran"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_job_is_retried_until_it_succeeds() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    // Fails on the first run, succeeds once the marker exists.
+    let marker = dir.join("retry-marker");
+    let script = format!(
+        "if [ -e {m} ]; then echo second time; exit 0; else touch {m}; echo first time; exit 5; fi",
+        m = marker.display()
+    );
+    let mut spec = spec_for(&uuid::Uuid::new_v4().to_string(), &["sh", "-c", &script]);
+    spec.node = Some("solo".into());
+    spec.retries = 2;
+    a.state.store.put_json(&keys::job(&spec.id), &spec).unwrap();
+    // first attempt fails, then (after the 10s retry delay) the second succeeds
+    eventually("first result", || {
+        a.state
+            .store
+            .get(&keys::result(&spec.id))
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let r: JobResult = a
+        .state
+        .store
+        .get(&keys::result(&spec.id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(r.exit_code, Some(5));
+    eventually("retried and succeeded", || {
+        a.state
+            .store
+            .get(&keys::result(&spec.id))
+            .unwrap()
+            .and_then(|r| r.parse::<JobResult>().ok())
+            .map(|r| r.exit_code == Some(0))
+            .unwrap_or(false)
+    })
+    .await;
+    let s2: JobSpec = a
+        .state
+        .store
+        .get(&keys::job(&spec.id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(s2.retry, 1);
     std::fs::remove_dir_all(dir).ok();
 }

@@ -111,8 +111,29 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
                 continue;
             }
         };
-        if spec.cancelled || state.store.get(&keys::result(&spec.id))?.is_some() {
+        if spec.cancelled {
             continue;
+        }
+        if let Some(result) = state
+            .store
+            .get(&keys::result(&spec.id))?
+            .and_then(|r| r.parse::<JobResult>().ok())
+        {
+            maybe_retry(state, &spec, &result, now)?;
+            continue;
+        }
+        match deps_state(state, &spec)? {
+            Deps::Ready => {}
+            Deps::Waiting => continue,
+            Deps::Failed(reason) => {
+                // Idempotent under LWW: every node computes the same answer.
+                let mut cancelled = spec.clone();
+                cancelled.cancelled = true;
+                cancelled.cancel_reason = Some(reason.clone());
+                state.store.put_json(&keys::job(&spec.id), &cancelled)?;
+                tracing::info!(job = %spec.id, reason, "cancelled: dependency did not succeed");
+                continue;
+            }
         }
         if state.running.lock().unwrap().contains_key(&spec.id) {
             continue;
@@ -151,6 +172,17 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
             Some(claim) => {
                 if has_capacity && now > claim.lease_until_ms.saturating_add(grace) {
                     tracing::warn!(job = %spec.id, holder = %claim.node, attempt = claim.attempt + 1, "lease expired, taking over");
+                    crate::notify::send(
+                        state,
+                        "lost",
+                        format!("lost: {}", &spec.id[..8]),
+                        format!(
+                            "{}\nexecutor {} went away; taking over (attempt {})",
+                            spec.cmd.join(" "),
+                            claim.node,
+                            claim.attempt + 1
+                        ),
+                    );
                     write_claim(state, &spec.id, claim.attempt + 1, None)?;
                     start(state.clone(), spec, true);
                 }
@@ -214,6 +246,41 @@ fn start(state: AppState, spec: JobSpec, settle: bool) {
                     tracing::error!(job = %id, error = %e, "writing result");
                 }
                 tracing::info!(job = %id, exit = ?result.exit_code, "finished");
+                let event = if result.error.as_deref() == Some("cancelled") {
+                    "cancelled"
+                } else if result.exit_code == Some(0) {
+                    "succeeded"
+                } else {
+                    "failed"
+                };
+                crate::notify::send(
+                    &state,
+                    event,
+                    format!(
+                        "{event}: {}",
+                        spec.tmux.clone().unwrap_or_else(|| id[..8].to_string())
+                    ),
+                    format!(
+                        "{}\nexit {:?}{}\n{}",
+                        spec.cmd.join(" "),
+                        result.exit_code,
+                        result
+                            .error
+                            .as_ref()
+                            .map(|e| format!(" ({e})"))
+                            .unwrap_or_default(),
+                        result
+                            .output_tail
+                            .lines()
+                            .rev()
+                            .take(5)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                );
             }
             Outcome::LostOwnership(to) => {
                 tracing::warn!(job = %id, to = %to, "stopped: another node holds the claim");
@@ -479,4 +546,83 @@ async fn tmux_kill(session: &str) {
         .args(["kill-session", "-t", session])
         .output()
         .await;
+}
+
+enum Deps {
+    Ready,
+    Waiting,
+    Failed(String),
+}
+
+/// Dependencies: all `after` jobs must have succeeded. A dependency that
+/// ended without success (and has no retries left) fails this job.
+fn deps_state(state: &AppState, spec: &JobSpec) -> anyhow::Result<Deps> {
+    for dep in &spec.after {
+        let dep_spec = state
+            .store
+            .get(&keys::job(dep))?
+            .and_then(|r| r.parse::<JobSpec>().ok());
+        let Some(dep_spec) = dep_spec else {
+            return Ok(Deps::Failed(format!(
+                "dependency {} is gone",
+                &dep[..dep.len().min(8)]
+            )));
+        };
+        let result = state
+            .store
+            .get(&keys::result(dep))?
+            .and_then(|r| r.parse::<JobResult>().ok());
+        match result {
+            Some(r) if r.exit_code == Some(0) => {}
+            Some(r) => {
+                let will_retry =
+                    r.error.as_deref() != Some("cancelled") && dep_spec.retry < dep_spec.retries;
+                if will_retry {
+                    return Ok(Deps::Waiting);
+                }
+                return Ok(Deps::Failed(format!(
+                    "dependency {} {}",
+                    &dep[..dep.len().min(8)],
+                    if r.error.as_deref() == Some("cancelled") {
+                        "was cancelled"
+                    } else {
+                        "failed"
+                    }
+                )));
+            }
+            None if dep_spec.cancelled => {
+                return Ok(Deps::Failed(format!(
+                    "dependency {} was cancelled",
+                    &dep[..dep.len().min(8)]
+                )));
+            }
+            None => return Ok(Deps::Waiting),
+        }
+    }
+    Ok(Deps::Ready)
+}
+
+/// Clear a failed result for another attempt when retries remain, after an
+/// exponential delay. Idempotent: every node writes the same `retry` value.
+fn maybe_retry(
+    state: &AppState,
+    spec: &JobSpec,
+    result: &JobResult,
+    now: u64,
+) -> anyhow::Result<()> {
+    let failed = result.exit_code != Some(0) && result.error.as_deref() != Some("cancelled");
+    if !failed || spec.retry >= spec.retries {
+        return Ok(());
+    }
+    let delay_ms = 10_000u64.saturating_mul(1u64 << spec.retry.min(10));
+    if now < result.finished_at_ms.saturating_add(delay_ms) {
+        return Ok(());
+    }
+    let mut next = spec.clone();
+    next.retry += 1;
+    state.store.put_json(&keys::job(&spec.id), &next)?;
+    state.store.delete(&keys::result(&spec.id))?;
+    state.store.delete(&keys::claim(&spec.id))?;
+    tracing::info!(job = %spec.id, retry = next.retry, of = spec.retries, "retrying failed job");
+    Ok(())
 }

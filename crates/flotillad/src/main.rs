@@ -6,6 +6,7 @@ mod exec;
 mod facts;
 mod gc;
 mod identity;
+mod notify;
 mod reconcile;
 mod scheduler;
 mod server;

@@ -424,7 +424,7 @@ async fn stream_one(
 #[derive(Subcommand, Debug)]
 pub enum JobCmd {
     /// Submit a job into the replicated store
-    Submit(SubmitArgs),
+    Submit(Box<SubmitArgs>),
     /// List jobs
     Ls {
         /// Include finished jobs older than this many hours (default 24)
@@ -469,6 +469,15 @@ pub struct SubmitArgs {
     /// Run inside a detached tmux session of this name on the executor
     #[arg(long)]
     tmux: Option<String>,
+    /// Only run after these jobs succeeded (id or prefix, repeatable)
+    #[arg(long = "after")]
+    after: Vec<String>,
+    /// Batch label for grouping
+    #[arg(long)]
+    batch: Option<String>,
+    /// Automatic retries on failure
+    #[arg(long, default_value_t = 0)]
+    retries: u32,
     #[arg(required = true, last = true)]
     cmd: Vec<String>,
 }
@@ -549,6 +558,7 @@ async fn node_names(c: &Client) -> Result<BTreeMap<String, String>> {
 pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
     match cmd {
         JobCmd::Submit(a) => {
+            let a = *a;
             let me = c.me().await?;
             let node = match &a.node {
                 Some(n) => {
@@ -577,6 +587,11 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
                 pick: a.pick,
                 tmux: a.tmux,
                 kind: None,
+                after: resolve_many(c, &a.after).await?,
+                batch: a.batch,
+                retries: a.retries,
+                retry: 0,
+                cancel_reason: None,
             };
             c.put_json(&keys::job(&spec.id), &spec).await?;
             if json && !a.wait {
@@ -625,6 +640,26 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
             }
             if let Some(pick) = &j.spec.pick {
                 println!("placement: {pick}");
+            }
+            if !j.spec.after.is_empty() {
+                println!(
+                    "after:     {}",
+                    j.spec
+                        .after
+                        .iter()
+                        .map(|a| a[..a.len().min(8)].to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if let Some(b) = &j.spec.batch {
+                println!("batch:     {b}");
+            }
+            if j.spec.retries > 0 {
+                println!("retries:   {} of {} used", j.spec.retry, j.spec.retries);
+            }
+            if let Some(r) = &j.spec.cancel_reason {
+                println!("reason:    {r}");
             }
             if let Some(t) = &j.spec.tmux {
                 println!("tmux:      {t}");
@@ -1770,6 +1805,11 @@ pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
                 pick: if a.pick == "any" { None } else { Some(a.pick) },
                 tmux: Some(name.clone()),
                 kind: Some("agent".into()),
+                after: Vec::new(),
+                batch: None,
+                retries: 0,
+                retry: 0,
+                cancel_reason: None,
             };
             c.put_json(&keys::job(&id), &spec).await?;
             if json && !a.wait {
@@ -1915,5 +1955,285 @@ pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
             session(c, SessionCmd::Attach { node, name, user }, json).await
         }
         AgentCmd::Stop { id } => job(c, JobCmd::Cancel { id }, json).await,
+    }
+}
+
+async fn resolve_many(c: &Client, prefixes: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in prefixes {
+        out.push(resolve_job(c, p).await?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+pub enum BatchCmd {
+    /// Submit N shards of one command; `{i}` and `{n}` in the command are substituted
+    Submit(BatchSubmitArgs),
+    /// Summary of every batch: counts per state
+    Ls,
+    /// Jobs in one batch
+    Show { batch: String },
+    /// Wait until every job in the batch is terminal; exit 1 if any did not succeed
+    Wait { batch: String },
+    /// Cancel every non-terminal job in the batch
+    Cancel { batch: String },
+}
+
+#[derive(Args, Debug)]
+pub struct BatchSubmitArgs {
+    /// Batch name (default: a short id)
+    #[arg(long)]
+    batch: Option<String>,
+    /// Number of shards
+    #[arg(short = 'n', long, default_value_t = 1)]
+    shards: u32,
+    #[arg(short = 'l', long = "selector")]
+    selector: Option<Selector>,
+    #[arg(long, default_value = "least-load")]
+    pick: String,
+    #[arg(long)]
+    cwd: Option<String>,
+    #[arg(short = 'e', long = "env")]
+    env: Vec<String>,
+    #[arg(long)]
+    timeout: Option<u64>,
+    #[arg(long, default_value_t = 0)]
+    retries: u32,
+    /// A final command to run after every shard succeeded (same cwd/env)
+    #[arg(long = "then")]
+    then: Option<String>,
+    /// Wait for the batch to finish
+    #[arg(long)]
+    wait: bool,
+    #[arg(required = true, last = true)]
+    cmd: Vec<String>,
+}
+
+fn batch_jobs<'a>(jobs: &'a [JobView], batch: &str) -> Vec<&'a JobView> {
+    jobs.iter()
+        .filter(|j| j.spec.batch.as_deref() == Some(batch))
+        .collect()
+}
+
+pub async fn batch(c: &Client, cmd: BatchCmd, _json: bool) -> Result<()> {
+    match cmd {
+        BatchCmd::Submit(a) => {
+            let me = c.me().await?;
+            let name = a
+                .batch
+                .clone()
+                .unwrap_or_else(|| format!("b-{}", &uuid::Uuid::new_v4().to_string()[..6]));
+            let env = parse_env(&a.env)?;
+            let mut ids = Vec::new();
+            for i in 0..a.shards {
+                let cmdv: Vec<String> = a
+                    .cmd
+                    .iter()
+                    .map(|w| {
+                        w.replace("{i}", &i.to_string())
+                            .replace("{n}", &a.shards.to_string())
+                    })
+                    .collect();
+                let spec = JobSpec {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    cmd: cmdv,
+                    cwd: a.cwd.clone(),
+                    env: env.clone(),
+                    selector: a.selector.clone().unwrap_or_default(),
+                    node: None,
+                    submitted_by: me.name.clone(),
+                    submitted_at_ms: flotilla_core::now_ms(),
+                    timeout_secs: a.timeout,
+                    cancelled: false,
+                    pick: if a.pick == "any" {
+                        None
+                    } else {
+                        Some(a.pick.clone())
+                    },
+                    tmux: None,
+                    kind: Some("shard".into()),
+                    after: Vec::new(),
+                    batch: Some(name.clone()),
+                    retries: a.retries,
+                    retry: 0,
+                    cancel_reason: None,
+                };
+                c.put_json(&keys::job(&spec.id), &spec).await?;
+                ids.push(spec.id);
+            }
+            if let Some(then) = &a.then {
+                let spec = JobSpec {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    cmd: vec!["sh".into(), "-c".into(), then.clone()],
+                    cwd: a.cwd.clone(),
+                    env: env.clone(),
+                    selector: a.selector.clone().unwrap_or_default(),
+                    node: None,
+                    submitted_by: me.name.clone(),
+                    submitted_at_ms: flotilla_core::now_ms(),
+                    timeout_secs: a.timeout,
+                    cancelled: false,
+                    pick: if a.pick == "any" {
+                        None
+                    } else {
+                        Some(a.pick.clone())
+                    },
+                    tmux: None,
+                    kind: Some("then".into()),
+                    after: ids.clone(),
+                    batch: Some(name.clone()),
+                    retries: 0,
+                    retry: 0,
+                    cancel_reason: None,
+                };
+                c.put_json(&keys::job(&spec.id), &spec).await?;
+            }
+            println!(
+                "batch {name}: {} shards{}",
+                a.shards,
+                if a.then.is_some() {
+                    " + 1 final job"
+                } else {
+                    ""
+                }
+            );
+            if a.wait {
+                return batch_wait(c, &name).await;
+            }
+            Ok(())
+        }
+        BatchCmd::Ls => {
+            let jobs = load_jobs(c).await?;
+            let mut names: Vec<String> = jobs.iter().filter_map(|j| j.spec.batch.clone()).collect();
+            names.sort();
+            names.dedup();
+            let mut t = Table::new();
+            t.load_preset(UTF8_FULL_CONDENSED);
+            t.set_header([
+                "batch",
+                "jobs",
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "cancelled",
+                "lost",
+                "newest",
+            ]);
+            for b in names {
+                let js = batch_jobs(&jobs, &b);
+                let count = |st: &[JobState]| js.iter().filter(|j| st.contains(&j.state)).count();
+                let newest = js.iter().map(|j| j.spec.submitted_at_ms).max().unwrap_or(0);
+                t.add_row(vec![
+                    Cell::new(&b),
+                    Cell::new(js.len()),
+                    Cell::new(count(&[JobState::Queued])),
+                    Cell::new(count(&[JobState::Claimed, JobState::Running])),
+                    Cell::new(count(&[JobState::Succeeded])).fg(Color::Green),
+                    Cell::new(count(&[JobState::Failed])).fg(Color::Red),
+                    Cell::new(count(&[JobState::Cancelled])),
+                    Cell::new(count(&[JobState::Lost])),
+                    Cell::new(ms_ago(newest) + " ago"),
+                ]);
+            }
+            println!("{t}");
+            Ok(())
+        }
+        BatchCmd::Show { batch: b } => {
+            let jobs = load_jobs(c).await?;
+            let names = node_names(c).await?;
+            let mut t = Table::new();
+            t.load_preset(UTF8_FULL_CONDENSED);
+            t.set_header(["id", "kind", "state", "node", "exit", "retries", "cmd"]);
+            for j in batch_jobs(&jobs, &b) {
+                let node = j
+                    .claim
+                    .as_ref()
+                    .map(|c| {
+                        names
+                            .get(&c.node)
+                            .cloned()
+                            .unwrap_or_else(|| c.node.clone())
+                    })
+                    .unwrap_or_default();
+                let exit = j
+                    .result
+                    .as_ref()
+                    .map(|r| {
+                        r.exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| r.error.clone().unwrap_or("?".into()))
+                    })
+                    .unwrap_or_default();
+                t.add_row(vec![
+                    Cell::new(&j.spec.id[..8]),
+                    Cell::new(j.spec.kind.clone().unwrap_or_default()),
+                    Cell::new(j.state.label()),
+                    Cell::new(node),
+                    Cell::new(exit),
+                    Cell::new(format!("{}/{}", j.spec.retry, j.spec.retries)),
+                    Cell::new(
+                        shell_words(&j.spec.cmd)
+                            .chars()
+                            .take(60)
+                            .collect::<String>(),
+                    ),
+                ]);
+            }
+            println!("{t}");
+            Ok(())
+        }
+        BatchCmd::Wait { batch: b } => batch_wait(c, &b).await,
+        BatchCmd::Cancel { batch: b } => {
+            let jobs = load_jobs(c).await?;
+            let mut n = 0;
+            for j in batch_jobs(&jobs, &b) {
+                if !j.state.is_terminal() {
+                    let mut spec = j.spec.clone();
+                    spec.cancelled = true;
+                    c.put_json(&keys::job(&spec.id), &spec).await?;
+                    n += 1;
+                }
+            }
+            println!("cancelled {n} jobs in {b}");
+            Ok(())
+        }
+    }
+}
+
+async fn batch_wait(c: &Client, b: &str) -> Result<()> {
+    let mut last = String::new();
+    loop {
+        let jobs = load_jobs(c).await?;
+        let js = batch_jobs(&jobs, b);
+        if js.is_empty() {
+            bail!("no jobs in batch {b}");
+        }
+        let summary: String = {
+            let mut counts = std::collections::BTreeMap::new();
+            for j in &js {
+                *counts.entry(j.state.label()).or_insert(0) += 1;
+            }
+            counts
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        if summary != last {
+            eprintln!("{b}: {summary}");
+            last = summary;
+        }
+        if js.iter().all(|j| j.state.is_terminal()) {
+            let ok = js.iter().all(|j| j.state == JobState::Succeeded);
+            if !ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        pause(Duration::from_secs(3)).await;
     }
 }
