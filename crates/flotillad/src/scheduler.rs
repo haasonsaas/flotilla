@@ -391,8 +391,10 @@ async fn tmux_request(
         .iter()
         .map(|a| shell_quote(a))
         .collect();
+    // Output goes to the pane (so `attach` shows it) and to the log via
+    // tee; the exit status is captured inside the group before tee ends.
     let inner = format!(
-        "exec > {log} 2>&1; {cmd}; code=$?; echo $code > {exit}; tmux wait-for -S {chan}",
+        "{{ {cmd}; echo $? > {exit}; }} 2>&1 | tee {log}; tmux wait-for -S {chan}",
         log = shell_quote(&log_path.to_string_lossy()),
         cmd = cmd.join(" "),
         exit = shell_quote(&exit_path.to_string_lossy()),
