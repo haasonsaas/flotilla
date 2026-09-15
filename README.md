@@ -176,6 +176,22 @@ apply = ["brew", "install", "jq"]
 4. The winner runs the job, streams the log to a local file, and writes `result/<id>` with the exit code and the last 4 KiB of output.
 5. `job show` reads the result from any node. `job logs` fetches the full log from the executor.
 
+Job states, derived from the replicated records rather than stored:
+
+| state | meaning |
+|---|---|
+| queued | submitted, no claim yet |
+| claimed | a node wrote a claim and is settling |
+| running | the executor recorded a start time on the claim |
+| succeeded / failed | a result exists with exit 0 / non-zero (or a timeout) |
+| cancelled | terminated on request, or cancelled before it ran |
+| lost | the claim's lease lapsed with no result: the executor went away and the outcome is unknown until another node takes it over |
+
+Every daemon's dashboard opens a drawer per job with the timeline (created,
+claimed, started, exited), the log (fetched from the executor through the
+local daemon), and the raw records with author and clock, so the replicated
+state itself is inspectable.
+
 Claims carry a lease (`job_lease_secs`, default 60). The executor renews it at a
 third of that interval while the job runs. If a lease lapses with no result,
 because the executor died or lost its network, any eligible node takes the job

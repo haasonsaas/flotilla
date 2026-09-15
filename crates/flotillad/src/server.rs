@@ -382,17 +382,91 @@ async fn post_exec(
         .unwrap()
 }
 
-async fn get_job_log(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
+#[derive(Deserialize)]
+struct LogQuery {
+    /// Return only the last N bytes.
+    #[serde(default)]
+    tail: Option<u64>,
+    /// Internal: set when proxying so two nodes never bounce a request.
+    #[serde(default)]
+    noproxy: bool,
+}
+
+/// The job's log. Served from this node's file when it ran here; otherwise
+/// fetched from the executor named in the claim, so the dashboard and the
+/// CLI can always ask the local daemon.
+async fn get_job_log(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<LogQuery>,
+) -> ApiResult<Response> {
     if id.is_empty() || id.contains('/') || id.contains("..") {
         return Ok((StatusCode::BAD_REQUEST, "bad job id").into_response());
     }
     let path = state.cfg.job_log_path(&id);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => {
+        Ok(mut bytes) => {
+            if let Some(n) = q.tail {
+                if (bytes.len() as u64) > n {
+                    let cut = bytes.len() - n as usize;
+                    // don't split a UTF-8 sequence
+                    let cut = (cut..bytes.len())
+                        .find(|&i| (bytes[i] & 0xC0) != 0x80)
+                        .unwrap_or(cut);
+                    bytes.drain(..cut);
+                }
+            }
             Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes).into_response())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok((StatusCode::NOT_FOUND, "no log for that job on this node").into_response())
+            if q.noproxy {
+                return Ok(
+                    (StatusCode::NOT_FOUND, "no log for that job on this node").into_response()
+                );
+            }
+            // Find the executor and ask it.
+            let claim = state
+                .store
+                .get(&keys::claim(&id))?
+                .and_then(|r| r.parse::<flotilla_core::schema::JobClaim>().ok());
+            let Some(claim) = claim.filter(|c| c.node != state.me.node_id) else {
+                return Ok(
+                    (StatusCode::NOT_FOUND, "no log for that job on this node").into_response()
+                );
+            };
+            let facts = state
+                .store
+                .get(&keys::node_facts(&claim.node))?
+                .and_then(|r| r.parse::<NodeFacts>().ok());
+            let Some(url) = facts.and_then(|f| peer_url(&f.tailscale_ips, f.port)) else {
+                return Ok((StatusCode::NOT_FOUND, "executor unknown").into_response());
+            };
+            let mut req = state
+                .http
+                .get(format!("{url}/v1/jobs/{id}/log"))
+                .query(&[("noproxy", "true")]);
+            if let Some(n) = q.tail {
+                req = req.query(&[("tail", n)]);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let bytes = resp.bytes().await?;
+                    Ok(
+                        ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes)
+                            .into_response(),
+                    )
+                }
+                Ok(resp) => Ok((
+                    StatusCode::NOT_FOUND,
+                    format!("executor answered {}", resp.status()),
+                )
+                    .into_response()),
+                Err(e) => Ok((
+                    StatusCode::BAD_GATEWAY,
+                    format!("executor unreachable: {e}"),
+                )
+                    .into_response()),
+            }
         }
         Err(e) => Err(e.into()),
     }

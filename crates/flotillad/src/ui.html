@@ -23,6 +23,16 @@
   button { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 6px; cursor: pointer; } button:hover { border-color: var(--acc); }
   .tag { display: inline-block; font-size: 11px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); margin-right: 4px; }
   #live { float: right; font-size: 12px; color: var(--muted); }
+  .st.lost { color: var(--bad); } .st.claimed { color: var(--warn); } .st.queued { color: var(--muted); }
+  tr.row { cursor: pointer; } tr.row:hover td { background: color-mix(in srgb, var(--acc) 6%, transparent); }
+  #drawer { position: fixed; top: 0; right: 0; height: 100vh; width: min(560px, 100vw); background: var(--card); border-left: 1px solid var(--line); box-shadow: -8px 0 24px rgba(0,0,0,.15); padding: 18px 20px; overflow: auto; box-sizing: border-box; }
+  #drawer[hidden] { display: none; }
+  #drawer h3 { margin: 0 0 10px; font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+  #drawer h4 { margin: 18px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  #drawer dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0; font-size: 13px; } #drawer dt { color: var(--muted); } #drawer dd { margin: 0; }
+  #drawer pre { font: 12px/1.4 ui-monospace, Menlo, monospace; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+  #drawer .rec { font: 12px ui-monospace, Menlo, monospace; display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
+  #drawer .close { float: right; }
   .empty { color: var(--muted); padding: 10px; }
 </style>
 </head>
@@ -37,6 +47,7 @@
 <h2>Agents &amp; jobs (last 24h)</h2>
 <table><thead><tr><th>id</th><th>kind</th><th>state</th><th>node</th><th>session</th><th>submitted</th><th>elapsed</th><th>exit</th><th>command</th><th></th></tr></thead><tbody id="jobs"></tbody></table>
 
+<aside id="drawer" hidden></aside>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -66,16 +77,65 @@ async function render() {
   const rows = jobs.records.map(r => r.value).filter(s => !(rs[s.id] && rs[s.id].finished_at_ms < cutoff)).sort((a, b) => b.submitted_at_ms - a.submitted_at_ms);
   $("jobs").innerHTML = rows.map(s => {
     const c = cl[s.id], r = rs[s.id];
-    let state = r ? (r.exit_code === 0 ? "succeeded" : "failed") : s.cancelled ? "cancelled" : c ? (c.lease_until_ms && Date.now() > c.lease_until_ms ? "orphaned" : "running") : "pending";
+    const state = stateOf(s, c, r);
     const node = c ? (names[c.node] || c.node) : "";
     const elapsed = c ? (r ? dur(r.started_at_ms, r.finished_at_ms) : dur(c.claimed_at_ms, Date.now())) : "";
     const exit = r ? (r.exit_code ?? (r.error || "?")) : "";
     const target = s.node ? (names[s.node] || s.node) : Object.entries(s.selector || {}).map(([k,v]) => k + "=" + v).join(",") || (s.pick || "any");
     const btn = (!r && !s.cancelled) ? `<button data-id="${esc(s.id)}">cancel</button>` : "";
-    return `<tr><td title="${esc(s.id)}">${esc(s.id.slice(0,8))}</td><td>${esc(s.kind || "job")}</td><td class="st ${state}">${state}</td><td>${esc(node)}<div class="sub">${esc(target)}</div></td>
+    return `<tr class="row" data-job="${esc(s.id)}"><td title="${esc(s.id)}">${esc(s.id.slice(0,8))}</td><td>${esc(s.kind || "job")}</td><td class="st ${state}">${state}</td><td>${esc(node)}<div class="sub">${esc(target)}</div></td>
       <td>${esc(s.tmux || "")}</td><td>${ago(s.submitted_at_ms)} ago<div class="sub">${esc(s.submitted_by)}</div></td><td>${elapsed}</td><td>${esc(exit)}</td><td class="cmd">${esc(s.cmd.join(" "))}</td><td>${btn}</td></tr>`;
   }).join("") || `<tr><td colspan="10" class="empty">no jobs</td></tr>`;
-  for (const b of document.querySelectorAll("button[data-id]")) b.onclick = () => cancel(b.dataset.id);
+  for (const b of document.querySelectorAll("button[data-id]")) b.onclick = (e) => { e.stopPropagation(); cancel(b.dataset.id); };
+  for (const tr of document.querySelectorAll("tr.row")) tr.onclick = () => openDrawer(tr.dataset.job);
+  if (openId) refreshDrawer();
+}
+function stateOf(s, c, r) {
+  if (r) return (r.error === "cancelled" || (s.cancelled && r.exit_code == null)) ? "cancelled" : r.exit_code === 0 ? "succeeded" : "failed";
+  if (s.cancelled) return "cancelled";
+  if (!c) return "queued";
+  if (c.lease_until_ms && Date.now() > c.lease_until_ms) return "lost";
+  return c.started_at_ms ? "running" : "claimed";
+}
+const hms = (ms) => ms ? new Date(ms).toLocaleTimeString([], {hour12: false}) + "." + String(ms % 1000).padStart(3, "0") : "";
+let openId = null;
+async function openDrawer(id) { openId = id; await refreshDrawer(); }
+function closeDrawer() { openId = null; $("drawer").hidden = true; }
+async function refreshDrawer() {
+  const id = openId; if (!id) return;
+  const raw = await j("/v1/records?prefix=job/" + id).catch(() => ({records: []}));
+  const rawC = await j("/v1/records?prefix=claim/" + id).catch(() => ({records: []}));
+  const rawR = await j("/v1/records?prefix=result/" + id).catch(() => ({records: []}));
+  const jr = raw.records[0], cr = rawC.records[0], rr = rawR.records[0];
+  if (!jr) { $("drawer").innerHTML = `<button class="close" onclick="closeDrawer()">close</button><h3>${esc(id)}</h3><p class="sub">no such job</p>`; $("drawer").hidden = false; return; }
+  const s = jr.value, c = cr && cr.value, r = rr && rr.value, state = stateOf(s, c, r);
+  let out = "";
+  try { const resp = await fetch("/v1/jobs/" + id + "/log?tail=16384"); out = resp.ok ? await resp.text() : (r ? r.output_tail : ""); } catch { out = r ? r.output_tail : ""; }
+  const timeline = [["job.created", s.submitted_at_ms, "by " + s.submitted_by]];
+  if (c) timeline.push(["job.claimed", c.claimed_at_ms, (names[c.node] || c.node) + " · attempt " + c.attempt]);
+  if (c && c.started_at_ms) timeline.push(["job.started", c.started_at_ms, ""]);
+  if (s.cancelled) timeline.push(["job.cancelled", null, "requested"]);
+  if (r) timeline.push(["job.exited", r.finished_at_ms, "exit " + (r.exit_code ?? "none") + (r.error ? " (" + r.error + ")" : "")]);
+  const recs = [jr, cr, rr].filter(Boolean).map(x => `<span>${esc(x.key.split("/")[0])}</span><span>${esc(x.author)} @ ${esc(String(x.hlc))}${x.deleted ? " (tombstone)" : ""}</span>`).join("");
+  $("drawer").innerHTML = `<button class="close" onclick="closeDrawer()">close</button>
+    <h3>${esc(id)}</h3>
+    <dl>
+      <dt>state</dt><dd class="st ${state}">${state}</dd>
+      <dt>kind</dt><dd>${esc(s.kind || "job")}</dd>
+      <dt>submitted</dt><dd>${esc(s.submitted_by)}</dd>
+      <dt>claimed by</dt><dd>${c ? esc(names[c.node] || c.node) : "–"}</dd>
+      <dt>reason</dt><dd>${esc(s.node ? "pinned to " + (names[s.node] || s.node) : s.pick || (Object.keys(s.selector || {}).length ? "selector " + Object.entries(s.selector).map(([k,v]) => k + "=" + v).join(",") : "any eligible node"))}</dd>
+      <dt>session</dt><dd>${esc(s.tmux || "–")}</dd>
+      <dt>created</dt><dd>${hms(s.submitted_at_ms)}</dd>
+      <dt>claimed</dt><dd>${c ? hms(c.claimed_at_ms) : "–"}</dd>
+      <dt>started</dt><dd>${c && c.started_at_ms ? hms(c.started_at_ms) : "–"}</dd>
+      <dt>finished</dt><dd>${r ? hms(r.finished_at_ms) : "–"}</dd>
+      <dt>command</dt><dd class="cmd">${esc(s.cmd.join(" "))}</dd>
+    </dl>
+    <h4>stdout</h4><pre>${esc(out) || "<span class=sub>(no output yet)</span>"}</pre>
+    <h4>timeline</h4><div class="rec">${timeline.map(([n, t, d]) => `<span>${n}</span><span>${t ? hms(t) : ""} ${esc(d)}</span>`).join("")}</div>
+    <h4>records</h4><div class="rec">${recs}</div>`;
+  $("drawer").hidden = false;
 }
 async function cancel(id) {
   const rec = await j("/v1/records/job/" + id);

@@ -113,6 +113,10 @@ pub struct JobClaim {
     /// How many times the job has been (re)claimed.
     #[serde(default = "one")]
     pub attempt: u32,
+    /// Set by the executor when the process actually starts (after the
+    /// settle window), so `claimed` and `running` are distinguishable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
 }
 
 fn one() -> u32 {
@@ -142,14 +146,19 @@ pub struct JobResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
-    Pending,
+    /// Submitted, nobody has claimed it.
+    Queued,
+    /// A node claimed it and is settling or about to start.
     Claimed,
-    /// Claimed, but the executor's lease has lapsed with no result; a node
-    /// will take it over.
-    Orphaned,
+    /// The executor reported the process started.
+    Running,
     Succeeded,
     Failed,
+    /// Terminated on request (or cancelled before it ran).
     Cancelled,
+    /// The executor's lease lapsed with no result: it went away and the
+    /// outcome is unknown until a node takes the job over.
+    Lost,
 }
 
 impl JobState {
@@ -162,7 +171,7 @@ impl JobState {
     }
 
     /// Like `derive`, but a claim whose lease lapsed before `now_ms` reads
-    /// as `Orphaned`. `now_ms == 0` disables the lease check.
+    /// as `Lost`. `now_ms == 0` disables the lease check.
     pub fn derive_at(
         spec: &JobSpec,
         claim: Option<&JobClaim>,
@@ -171,17 +180,41 @@ impl JobState {
     ) -> JobState {
         match (result, claim) {
             (Some(r), _) => {
-                if r.exit_code == Some(0) {
+                if r.error.as_deref() == Some("cancelled")
+                    || (spec.cancelled && r.exit_code.is_none())
+                {
+                    JobState::Cancelled
+                } else if r.exit_code == Some(0) {
                     JobState::Succeeded
                 } else {
                     JobState::Failed
                 }
             }
             (None, _) if spec.cancelled => JobState::Cancelled,
-            (None, Some(c)) if now_ms > 0 && c.lease_expired_at(now_ms) => JobState::Orphaned,
+            (None, Some(c)) if now_ms > 0 && c.lease_expired_at(now_ms) => JobState::Lost,
+            (None, Some(c)) if c.started_at_ms.is_some() => JobState::Running,
             (None, Some(_)) => JobState::Claimed,
-            (None, None) => JobState::Pending,
+            (None, None) => JobState::Queued,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            JobState::Queued => "queued",
+            JobState::Claimed => "claimed",
+            JobState::Running => "running",
+            JobState::Succeeded => "succeeded",
+            JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
+            JobState::Lost => "lost",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        )
     }
 }
 
@@ -252,6 +285,11 @@ mod tests {
             claimed_at_ms: 0,
             lease_until_ms: 100,
             attempt: 1,
+            started_at_ms: None,
+        };
+        let running = JobClaim {
+            started_at_ms: Some(5),
+            ..claim.clone()
         };
         let ok = JobResult {
             job_id: "j".into(),
@@ -266,10 +304,24 @@ mod tests {
             exit_code: Some(1),
             ..ok.clone()
         };
-        assert_eq!(JobState::derive(&spec(), None, None), JobState::Pending);
+        let killed = JobResult {
+            exit_code: None,
+            error: Some("cancelled".into()),
+            ..ok.clone()
+        };
+        let timed_out = JobResult {
+            exit_code: None,
+            error: Some("timed out".into()),
+            ..ok.clone()
+        };
+        assert_eq!(JobState::derive(&spec(), None, None), JobState::Queued);
         assert_eq!(
             JobState::derive(&spec(), Some(&claim), None),
             JobState::Claimed
+        );
+        assert_eq!(
+            JobState::derive(&spec(), Some(&running), None),
+            JobState::Running
         );
         assert_eq!(
             JobState::derive(&spec(), Some(&claim), Some(&ok)),
@@ -279,30 +331,45 @@ mod tests {
             JobState::derive(&spec(), Some(&claim), Some(&bad)),
             JobState::Failed
         );
+        assert_eq!(
+            JobState::derive(&spec(), Some(&claim), Some(&timed_out)),
+            JobState::Failed
+        );
+        assert_eq!(
+            JobState::derive(&spec(), Some(&claim), Some(&killed)),
+            JobState::Cancelled,
+            "a kill on request is not a failure"
+        );
         let cancelled = JobSpec {
             cancelled: true,
             ..spec()
         };
         assert_eq!(
-            JobState::derive(&cancelled, Some(&claim), None),
+            JobState::derive(&cancelled, None, None),
+            JobState::Cancelled
+        );
+        assert_eq!(
+            JobState::derive(&cancelled, Some(&running), None),
             JobState::Cancelled
         );
         assert_eq!(
             JobState::derive(&cancelled, Some(&claim), Some(&ok)),
-            JobState::Succeeded
+            JobState::Succeeded,
+            "finished before the cancel landed"
         );
         assert_eq!(
-            JobState::derive_at(&spec(), Some(&claim), None, 50),
-            JobState::Claimed
+            JobState::derive_at(&spec(), Some(&running), None, 50),
+            JobState::Running
         );
         assert_eq!(
-            JobState::derive_at(&spec(), Some(&claim), None, 101),
-            JobState::Orphaned
+            JobState::derive_at(&spec(), Some(&running), None, 101),
+            JobState::Lost
         );
         assert_eq!(
             JobState::derive_at(&spec(), Some(&claim), Some(&ok), 101),
             JobState::Succeeded
         );
+        assert!(JobState::Cancelled.is_terminal() && !JobState::Lost.is_terminal());
     }
 
     #[test]

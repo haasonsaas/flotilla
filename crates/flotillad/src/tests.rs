@@ -439,6 +439,7 @@ async fn expired_lease_is_taken_over() {
         claimed_at_ms: 1,
         lease_until_ms: 1,
         attempt: 1,
+        started_at_ms: None,
     };
     a.state
         .store
@@ -533,6 +534,7 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
         claimed_at_ms: now,
         lease_until_ms: now + 600_000,
         attempt: 2,
+        started_at_ms: None,
     };
     a.state
         .store
@@ -760,6 +762,7 @@ async fn gc_keeps_cancelled_job_while_its_lease_is_live() {
         claimed_at_ms: now - 1000,
         lease_until_ms: now + 60_000,
         attempt: 1,
+        started_at_ms: None,
     };
     a.state
         .store

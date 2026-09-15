@@ -623,6 +623,12 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
             } else if !j.spec.selector.is_empty() {
                 println!("selector:  {}", j.spec.selector);
             }
+            if let Some(pick) = &j.spec.pick {
+                println!("placement: {pick}");
+            }
+            if let Some(t) = &j.spec.tmux {
+                println!("tmux:      {t}");
+            }
             if let Some(cl) = &j.claim {
                 let now = flotilla_core::now_ms();
                 let lease = if cl.lease_until_ms == 0 {
@@ -639,6 +645,44 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
                     cl.attempt,
                     lease
                 );
+            }
+            println!("--- timeline ---");
+            let ts = |ms: u64| {
+                chrono::DateTime::<chrono::Local>::from(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms),
+                )
+                .format("%H:%M:%S%.3f")
+                .to_string()
+            };
+            println!(
+                "created   {}  by {}",
+                ts(j.spec.submitted_at_ms),
+                j.spec.submitted_by
+            );
+            if let Some(cl) = &j.claim {
+                println!(
+                    "claimed   {}  by {} (attempt {})",
+                    ts(cl.claimed_at_ms),
+                    names.get(&cl.node).unwrap_or(&cl.node),
+                    cl.attempt
+                );
+                if let Some(st) = cl.started_at_ms {
+                    println!("started   {}", ts(st));
+                }
+            }
+            if let Some(r) = &j.result {
+                println!(
+                    "finished  {}  exit {:?}{}",
+                    ts(r.finished_at_ms),
+                    r.exit_code,
+                    r.error
+                        .as_ref()
+                        .map(|e| format!(" ({e})"))
+                        .unwrap_or_default()
+                );
+            }
+            if j.spec.cancelled {
+                println!("cancelled (request replicated; see result for outcome)");
             }
             if let Some(r) = &j.result {
                 println!(
@@ -746,9 +790,10 @@ async fn job_ls_once(c: &Client, hours: u64, json: bool) -> Result<()> {
         let state = match j.state {
             JobState::Succeeded => Cell::new("succeeded").fg(Color::Green),
             JobState::Failed => Cell::new("failed").fg(Color::Red),
-            JobState::Claimed => Cell::new("running").fg(Color::Yellow),
-            JobState::Orphaned => Cell::new("orphaned").fg(Color::Red),
-            JobState::Pending => Cell::new("pending"),
+            JobState::Running => Cell::new("running").fg(Color::Yellow),
+            JobState::Claimed => Cell::new("claimed").fg(Color::Yellow),
+            JobState::Lost => Cell::new("lost").fg(Color::Red),
+            JobState::Queued => Cell::new("queued"),
             JobState::Cancelled => Cell::new("cancelled").fg(Color::DarkGrey),
         };
         let node = j
@@ -836,7 +881,7 @@ async fn wait(c: &Client, id: &str, json: bool) -> Result<()> {
             let _ = std::io::stdout().flush();
             std::process::exit(r.exit_code.unwrap_or(1));
         }
-        if state == JobState::Cancelled {
+        if state == JobState::Cancelled && result.is_none() {
             if claim.is_some() && cancelled_polls < 15 {
                 // the executor will write a result once it has killed the process
                 cancelled_polls += 1;
@@ -1784,7 +1829,7 @@ pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
                 };
                 let last = match (&j.state, &j.result, &node_id) {
                     (_, Some(r), _) => r.output_tail.lines().last().unwrap_or("").to_string(),
-                    (JobState::Claimed, None, Some(nid)) => {
+                    (JobState::Running | JobState::Claimed, None, Some(nid)) => {
                         // live: peek at the session's pane on the executor
                         match st
                             .nodes
@@ -1820,9 +1865,10 @@ pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
                 let state_cell = match j.state {
                     JobState::Succeeded => Cell::new("done").fg(Color::Green),
                     JobState::Failed => Cell::new("failed").fg(Color::Red),
-                    JobState::Claimed => Cell::new("running").fg(Color::Yellow),
-                    JobState::Orphaned => Cell::new("orphaned").fg(Color::Red),
-                    JobState::Pending => Cell::new("queued"),
+                    JobState::Running => Cell::new("running").fg(Color::Yellow),
+                    JobState::Claimed => Cell::new("claimed").fg(Color::Yellow),
+                    JobState::Lost => Cell::new("lost").fg(Color::Red),
+                    JobState::Queued => Cell::new("queued"),
                     JobState::Cancelled => Cell::new("stopped").fg(Color::DarkGrey),
                 };
                 let last: String = last.chars().take(60).collect();
