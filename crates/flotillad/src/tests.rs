@@ -714,3 +714,104 @@ async fn events_stream_reports_changes_with_prefix_filter() {
     assert!(got[1].deleted);
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gc_keeps_cancelled_job_while_its_lease_is_live() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    let now = flotilla_core::now_ms();
+    let retention_ms = a.state.cfg.job_retention_hours * 3600 * 1000;
+    let spec = JobSpec {
+        id: "long".into(),
+        cmd: vec!["true".into()],
+        cwd: None,
+        env: Default::default(),
+        selector: Default::default(),
+        node: Some("elsewhere".into()),
+        submitted_by: "test".into(),
+        submitted_at_ms: now - retention_ms - 60_000,
+        timeout_secs: None,
+        cancelled: true,
+    };
+    a.state.store.put_json(&keys::job("long"), &spec).unwrap();
+    let claim = JobClaim {
+        job_id: "long".into(),
+        node: "id-elsewhere".into(),
+        claimed_at_ms: now - 1000,
+        lease_until_ms: now + 60_000,
+        attempt: 1,
+    };
+    a.state
+        .store
+        .put_json(&keys::claim("long"), &claim)
+        .unwrap();
+    crate::gc::pass(&a.state).unwrap();
+    assert!(
+        a.state.store.get(&keys::job("long")).unwrap().is_some(),
+        "still claimed: must not retire"
+    );
+    // once the lease lapsed long ago, it goes
+    let dead = JobClaim {
+        lease_until_ms: now - retention_ms - 60_000,
+        ..claim
+    };
+    a.state.store.put_json(&keys::claim("long"), &dead).unwrap();
+    crate::gc::pass(&a.state).unwrap();
+    assert!(a.state.store.get(&keys::job("long")).unwrap().is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_leaves_claim_and_writes_no_result() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node("solo", pa, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let spec = JobSpec {
+        id: id.clone(),
+        cmd: vec!["tail".into(), "-f".into(), "/dev/null".into()],
+        cwd: None,
+        env: Default::default(),
+        selector: Default::default(),
+        node: Some("solo".into()),
+        submitted_by: "test".into(),
+        submitted_at_ms: flotilla_core::now_ms(),
+        timeout_secs: None,
+        cancelled: false,
+    };
+    a.state.store.put_json(&keys::job(&id), &spec).unwrap();
+    eventually("claimed", || {
+        a.state.store.get(&keys::claim(&id)).unwrap().is_some()
+    })
+    .await;
+    pause(a.state.cfg.settle_window() + Duration::from_secs(1)).await;
+    assert!(a.state.running.lock().unwrap().contains_key(&id));
+    // simulate SIGTERM handling
+    a.state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let tokens: Vec<_> = a.state.running.lock().unwrap().values().cloned().collect();
+    for t in tokens {
+        t.cancel();
+    }
+    eventually("runner exited", || {
+        !a.state.running.lock().unwrap().contains_key(&id)
+    })
+    .await;
+    assert!(
+        a.state.store.get(&keys::result(&id)).unwrap().is_none(),
+        "no result on shutdown"
+    );
+    let claim: JobClaim = a
+        .state
+        .store
+        .get(&keys::claim(&id))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(claim.node, "id-solo", "claim kept for resume/takeover");
+    std::fs::remove_dir_all(dir).ok();
+}

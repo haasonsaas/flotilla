@@ -36,6 +36,9 @@ pub struct AppState {
     pub running: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Per-peer sync bookkeeping, keyed like `sync_loop::Candidate::key`.
     pub sync_state: Arc<Mutex<HashMap<String, PeerSyncState>>>,
+    /// Set on SIGTERM: runners must not write results for jobs killed by
+    /// shutdown; their claims stay for resume or takeover.
+    pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Every applied store change, for `/v1/events` subscribers.
     pub events: tokio::sync::broadcast::Sender<RecordEvent>,
 }
@@ -66,6 +69,7 @@ impl AppState {
             running: Arc::new(Mutex::new(HashMap::new())),
             sync_state: Arc::new(Mutex::new(HashMap::new())),
             events,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

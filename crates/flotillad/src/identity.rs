@@ -101,7 +101,10 @@ pub struct Tailscale {
 }
 
 const STATUS_TTL: Duration = Duration::from_secs(5);
-const WHOIS_TTL: Duration = Duration::from_secs(120);
+const WHOIS_TTL: Duration = Duration::from_secs(20);
+/// Bound on a single `tailscale` invocation. Under heavy load the CLI can
+/// stall; requests must not hang on it.
+const CLI_TIMEOUT: Duration = Duration::from_secs(8);
 
 impl Tailscale {
     pub fn new(bin: Option<PathBuf>) -> Result<Tailscale> {
@@ -118,10 +121,9 @@ impl Tailscale {
     }
 
     async fn run(&self, args: &[&str]) -> Result<Value> {
-        let out = Command::new(&self.bin)
-            .args(args)
-            .output()
+        let out = tokio::time::timeout(CLI_TIMEOUT, Command::new(&self.bin).args(args).output())
             .await
+            .with_context(|| format!("tailscale {:?} timed out after {:?}", args, CLI_TIMEOUT))?
             .with_context(|| format!("running {}", self.bin.display()))?;
         if !out.status.success() {
             bail!(
@@ -140,9 +142,21 @@ impl Tailscale {
                 return Ok(v.clone());
             }
         }
-        let v = self.run(&["status", "--json"]).await?;
-        *self.status_cache.lock().unwrap() = Some((Instant::now(), v.clone()));
-        Ok(v)
+        match self.run(&["status", "--json"]).await {
+            Ok(v) => {
+                *self.status_cache.lock().unwrap() = Some((Instant::now(), v.clone()));
+                Ok(v)
+            }
+            Err(e) => {
+                // Serve the last known peer list rather than failing every
+                // request while the CLI is slow; it refreshes next call.
+                if let Some((_, v)) = self.status_cache.lock().unwrap().as_ref() {
+                    tracing::warn!(error = %e, "tailscale status failed; using cached peer list");
+                    return Ok(v.clone());
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn me(&self) -> Result<NodeInfo> {
@@ -245,6 +259,12 @@ impl Tailscale {
                 })
             }
             Err(e) => {
+                // Keep the last answer for this IP if we have one: a slow
+                // CLI must not lock out (or admit) a peer at random.
+                if let Some((_, prev)) = self.whois_cache.lock().unwrap().get(&ip) {
+                    tracing::warn!(%ip, error = %e, "whois failed; using cached identity");
+                    return Ok(prev.clone());
+                }
                 tracing::debug!(%ip, error = %e, "whois failed");
                 None
             }

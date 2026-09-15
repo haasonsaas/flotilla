@@ -2,7 +2,7 @@
 
 use crate::server::{pause, AppState};
 use flotilla_core::keys;
-use flotilla_core::schema::{JobResult, JobSpec};
+use flotilla_core::schema::{JobClaim, JobResult, JobSpec};
 use flotilla_core::Hlc;
 use std::time::Duration;
 
@@ -23,7 +23,11 @@ pub fn pass(state: &AppState) -> anyhow::Result<()> {
     let now = flotilla_core::now_ms();
     let retired = retire_jobs(state, now)?;
     let horizon_ms = now.saturating_sub(state.cfg.gc_horizon_days * 24 * 3600 * 1000);
-    let removed = state.store.gc(Hlc::from_parts(horizon_ms, 0))?;
+    let forget_ms = now.saturating_sub(state.cfg.gc_forget_days * 24 * 3600 * 1000);
+    let removed = state.store.gc(
+        Hlc::from_parts(horizon_ms, 0),
+        Hlc::from_parts(forget_ms, 0),
+    )?;
     if retired > 0 || removed > 0 {
         tracing::info!(
             retired_jobs = retired,
@@ -49,10 +53,18 @@ fn retire_jobs(state: &AppState, now: u64) -> anyhow::Result<usize> {
             .store
             .get(&keys::result(&spec.id))?
             .and_then(|r| r.parse::<JobResult>().ok());
-        let done_at = match (&result, spec.cancelled) {
-            (Some(r), _) => Some(r.finished_at_ms),
-            (None, true) => Some(spec.submitted_at_ms),
-            (None, false) => None,
+        let claim = state
+            .store
+            .get(&keys::claim(&spec.id))?
+            .and_then(|r| r.parse::<JobClaim>().ok());
+        let done_at = match (&result, spec.cancelled, &claim) {
+            (Some(r), _, _) => Some(r.finished_at_ms),
+            // Cancelled and never claimed: dead since submission.
+            (None, true, None) => Some(spec.submitted_at_ms),
+            // Cancelled while claimed: the executor is killing it and will
+            // write a result. Only retire once its lease has clearly lapsed.
+            (None, true, Some(c)) if c.lease_expired_at(now) => Some(c.lease_until_ms),
+            _ => None,
         };
         let Some(done_at) = done_at else { continue };
         if done_at >= cutoff {

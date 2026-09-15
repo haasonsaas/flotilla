@@ -117,6 +117,9 @@ async fn shutdown_on_signal(state: server::AppState) {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     tracing::info!(jobs = running.len(), "shutting down");
     for (_, token) in &running {
         token.cancel();

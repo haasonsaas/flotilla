@@ -61,7 +61,7 @@ A last-writer-wins key/value map replicated by anti-entropy sync.
   state is exposed on `/v1/syncstate`; `/v1/syncnow` forces a round.
 - Known peers are dialed on the port in their facts record. `seeds` in the
   config bootstrap peers that discovery cannot reach on the default port.
-- Deletes are tombstones. Garbage collection is future work.
+- Deletes are tombstones. GC (2026-09-15): tombstones older than the horizon collapse to a per-key `(key, hlc)` marker in a `collected` table; merges of a live record not newer than the marker are refused (`Collected`). Rejected merges still advance the version vector. A store-wide horizon was tried first and rejected because it blocked never-deleted records from long-offline or new nodes.
 - Persistence: redb, one file per node under the data dir.
 
 ### 4. Exec (`exec`)

@@ -1,7 +1,6 @@
-//! Anti-entropy: every interval, sync with one online peer. Peers that
-//! already have a facts record in our store (known fleet members) are
-//! preferred so we don't spend most rounds on tailnet nodes that don't run
-//! flotillad. A known peer is dialed on the port it advertises in its facts;
+//! Anti-entropy: every interval, sync with every known fleet member (peers
+//! with a facts record in our store) and probe one unknown peer or seed, so
+//! rounds are not wasted on tailnet nodes that don't run flotillad. A known peer is dialed on the port it advertises in its facts;
 //! unknown peers and configured seeds are tried at their given/default port.
 //! Failures back off exponentially per peer, and the per-peer state is
 //! exposed on `/v1/syncstate`.
@@ -87,16 +86,19 @@ async fn round(state: &AppState) -> anyhow::Result<()> {
     };
     let known: Vec<&Candidate> = ready.iter().copied().filter(|c| c.known).collect();
     let unknown: Vec<&Candidate> = ready.iter().copied().filter(|c| !c.known).collect();
-    let pick = {
+    // Every known fleet member each round, so the scheduler's settle
+    // window (two rounds) really does see everyone's claims; plus one
+    // unknown peer or seed per round to discover new members cheaply.
+    for c in &known {
+        sync_candidate(state, c).await;
+    }
+    let probe = {
         let mut rng = rand::rng();
-        if !known.is_empty() && (unknown.is_empty() || rng.random_bool(0.8)) {
-            known.choose(&mut rng).copied()
-        } else {
-            unknown.choose(&mut rng).copied()
-        }
+        unknown.choose(&mut rng).copied()
     };
-    let Some(c) = pick else { return Ok(()) };
-    sync_candidate(state, c).await;
+    if let Some(c) = probe {
+        sync_candidate(state, c).await;
+    }
     Ok(())
 }
 
@@ -167,7 +169,7 @@ pub async fn sync_with(state: &AppState, name: &str, base: &str) -> anyhow::Resu
     if stats.rejected() > 0 {
         tracing::warn!(
             peer = name,
-            before_horizon = stats.before_horizon,
+            collected = stats.collected,
             clock_skew = stats.clock_skew,
             "rejected records from peer"
         );

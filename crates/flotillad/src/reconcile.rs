@@ -41,9 +41,19 @@ async fn pass(state: &AppState) -> anyhow::Result<()> {
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
-            match tokio::fs::write(&path, &f.content).await {
+            // Write to a sibling and rename so readers (and the ensure
+            // commands that may run moments later) never see a partial file.
+            let tmp = format!("{path}.flotilla-tmp");
+            let written = match tokio::fs::write(&tmp, &f.content).await {
+                Ok(()) => tokio::fs::rename(&tmp, &path).await,
+                Err(e) => Err(e),
+            };
+            match written {
                 Ok(()) => report.changes.push(format!("wrote {path}")),
-                Err(e) => report.errors.push(format!("write {path}: {e}")),
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    report.errors.push(format!("write {path}: {e}"));
+                }
             }
         }
         #[cfg(unix)]

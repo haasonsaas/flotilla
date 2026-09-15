@@ -9,13 +9,27 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(10);
+
 /// Spawn the command and return a receiver of frames. The final frame is
 /// always `Exit` (or `Error` followed by `Exit { code: None }`). Cancelling
 /// the token kills the child.
 pub fn spawn(req: ExecRequest, cancel: CancellationToken) -> mpsc::Receiver<ExecFrame> {
     let (tx, rx) = mpsc::channel(256);
+    let done = std::sync::Arc::new(tokio::sync::Notify::new());
+    let keep_tx = tx.clone();
+    let keep_done = done.clone();
+    tokio::spawn(async move {
+        loop {
+            let waited = tokio::time::timeout(KEEPALIVE_EVERY, keep_done.notified()).await;
+            if waited.is_ok() || keep_tx.send(ExecFrame::Keepalive).await.is_err() {
+                return;
+            }
+        }
+    });
     tokio::spawn(async move {
         run(req, cancel, tx).await;
+        done.notify_one();
     });
     rx
 }

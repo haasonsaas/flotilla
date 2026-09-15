@@ -6,6 +6,8 @@ use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
+const EXEC_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct Client {
     pub base: String,
@@ -18,6 +20,7 @@ impl Client {
             base: base.trim_end_matches('/').to_string(),
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(3))
+                .tcp_keepalive(Duration::from_secs(30))
                 .build()
                 .expect("client"),
         }
@@ -193,23 +196,38 @@ impl Client {
             .with_context(|| format!("connecting to {}", self.base))?;
         let resp = Self::check(resp).await?;
         let mut buf: Vec<u8> = Vec::new();
-        Ok(resp.bytes_stream().flat_map(move |chunk| {
-            let mut frames = Vec::new();
-            match chunk {
-                Ok(bytes) => {
-                    buf.extend_from_slice(&bytes);
-                    while let Some(i) = buf.iter().position(|&c| c == b'\n') {
-                        let line: Vec<u8> = buf.drain(..=i).collect();
-                        frames.push(
-                            serde_json::from_slice::<ExecFrame>(&line[..line.len() - 1])
-                                .map_err(Into::into),
-                        );
+        // The daemon sends a keepalive frame every 10s while the process is
+        // silent, so a minute without bytes means the peer is gone.
+        let chunks = tokio_stream::StreamExt::timeout(resp.bytes_stream(), EXEC_IDLE_TIMEOUT);
+        Ok(chunks
+            .flat_map(move |chunk| {
+                let mut frames = Vec::new();
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(_) => {
+                        frames.push(Err(anyhow!(
+                            "no data from peer for {:?}; connection presumed dead",
+                            EXEC_IDLE_TIMEOUT
+                        )));
+                        return futures::stream::iter(frames);
                     }
+                };
+                match chunk {
+                    Ok(bytes) => {
+                        buf.extend_from_slice(&bytes);
+                        while let Some(i) = buf.iter().position(|&c| c == b'\n') {
+                            let line: Vec<u8> = buf.drain(..=i).collect();
+                            match serde_json::from_slice::<ExecFrame>(&line[..line.len() - 1]) {
+                                Ok(ExecFrame::Keepalive) => {}
+                                other => frames.push(other.map_err(Into::into)),
+                            }
+                        }
+                    }
+                    Err(e) => frames.push(Err(e.into())),
                 }
-                Err(e) => frames.push(Err(e.into())),
-            }
-            futures::stream::iter(frames)
-        }))
+                futures::stream::iter(frames)
+            })
+            .boxed())
     }
 
     pub async fn job_log(&self, id: &str) -> Result<Option<String>> {

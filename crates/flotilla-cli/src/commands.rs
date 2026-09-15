@@ -413,6 +413,7 @@ async fn stream_one(
             }
             ExecFrame::Error { message } => eprintln!("[{name:<width$}] error: {message}"),
             ExecFrame::Exit { code: c } => code = c,
+            ExecFrame::Keepalive => {}
         }
     }
     Ok(code)
@@ -815,10 +816,15 @@ async fn wait(c: &Client, id: &str, json: bool) -> Result<()> {
                 print_json(&r)?;
             } else {
                 print!("{}", r.output_tail);
+                if !r.output_tail.ends_with('\n') && !r.output_tail.is_empty() {
+                    println!();
+                }
                 if let Some(e) = &r.error {
                     eprintln!("error: {e}");
                 }
             }
+            // process::exit skips buffered-stdout flushing
+            let _ = std::io::stdout().flush();
             std::process::exit(r.exit_code.unwrap_or(1));
         }
         if state == JobState::Cancelled {
@@ -1278,6 +1284,7 @@ async fn run_remote_install_env(
             Ok(ExecFrame::Exit { code: None }) if saw_output => return Ok(()),
             Ok(ExecFrame::Exit { code }) => bail!("install exited with {code:?}"),
             Ok(ExecFrame::Error { message }) => bail!("install error: {message}"),
+            Ok(ExecFrame::Keepalive) => {}
             Err(_) if saw_output => return Ok(()),
             Err(e) => return Err(e),
         }
@@ -1393,6 +1400,7 @@ async fn exec_collect(
             ExecFrame::Stderr { data } => err.push_str(&data),
             ExecFrame::Error { message } => err.push_str(&message),
             ExecFrame::Exit { code: c } => code = c,
+            ExecFrame::Keepalive => {}
         }
     }
     Ok((code, out, err))
@@ -1499,7 +1507,7 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
             let (st, n) = find_node(c, &node).await?;
             let client = node_url(c, &st, &n)?;
             let line = text.join(" ");
-            let mut args = vec!["send-keys", "-t", name.as_str(), line.as_str()];
+            let mut args = vec!["send-keys", "-t", name.as_str(), "--", line.as_str()];
             if !no_enter {
                 args.push("Enter");
             }

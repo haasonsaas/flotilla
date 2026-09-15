@@ -5,15 +5,18 @@
 //! - `vv`: author -> max HLC seen from that author (the version vector)
 //! - `by_version`: (author, hlc) -> key, so `delta_since` walks only the
 //!   records a peer has not seen instead of scanning everything
+//! - `collected`: key -> hlc of a garbage-collected tombstone
 //! - `meta`: small counters, currently the GC horizon
 //!
 //! The version vector is maintained explicitly on every write and merge so
 //! sync deltas stay monotonic even after a key is overwritten by a
 //! different author.
 //!
-//! Garbage collection: tombstones older than a horizon are dropped, and the
-//! horizon is remembered so that a record older than it arriving later (from
-//! a node that was away for a long time) is rejected rather than resurrected.
+//! Garbage collection: tombstones older than a horizon are dropped, and just
+//! `(key, hlc)` is kept in `collected` so a stale live copy of that key
+//! arriving later (from a node that missed the delete) is rejected rather
+//! than resurrected. Keys that were never deleted are never affected, so a
+//! node that was away for a long time, or a brand-new node, still converges.
 
 use crate::hlc::{Clock, Hlc};
 use crate::record::{NodeId, Record};
@@ -28,6 +31,8 @@ const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("records");
 const VV: TableDefinition<&str, u64> = TableDefinition::new("vv");
 const BY_VERSION: TableDefinition<(&str, u64), &str> = TableDefinition::new("by_version");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// key -> hlc of the tombstone that was garbage-collected for it.
+const COLLECTED: TableDefinition<&str, u64> = TableDefinition::new("collected");
 const META_HORIZON: &str = "gc_horizon";
 
 pub type VersionVector = BTreeMap<NodeId, Hlc>;
@@ -75,8 +80,9 @@ pub enum MergeOutcome {
     Applied,
     /// The local record is the same or newer.
     Superseded,
-    /// Older than the GC horizon; may have had its tombstone collected.
-    BeforeHorizon,
+    /// A live copy not newer than a tombstone this store already
+    /// collected: a stale record from a peer that missed the delete.
+    Collected,
     /// Timestamp too far in the future relative to this node's clock.
     ClockSkew,
 }
@@ -85,13 +91,13 @@ pub enum MergeOutcome {
 pub struct MergeStats {
     pub applied: usize,
     pub superseded: usize,
-    pub before_horizon: usize,
+    pub collected: usize,
     pub clock_skew: usize,
 }
 
 impl MergeStats {
     pub fn rejected(&self) -> usize {
-        self.before_horizon + self.clock_skew
+        self.collected + self.clock_skew
     }
 }
 
@@ -144,6 +150,7 @@ impl Store {
             txn.open_table(RECORDS)?;
             txn.open_table(BY_VERSION)?;
             txn.open_table(META)?;
+            txn.open_table(COLLECTED)?;
             let vv = txn.open_table(VV)?;
             // Warm the clock past anything we have already issued so a
             // restart never reuses a timestamp.
@@ -293,38 +300,55 @@ impl Store {
 
     pub fn merge_checked(&self, incoming: &Record) -> Result<MergeOutcome> {
         let now_wall = crate::now_ms();
-        if incoming.hlc.wall_ms() > now_wall.saturating_add(self.opts.max_skew_ms) {
-            return Ok(MergeOutcome::ClockSkew);
+        let skewed = incoming.hlc.wall_ms() > now_wall.saturating_add(self.opts.max_skew_ms);
+        if !skewed {
+            self.clock.observe(incoming.hlc);
         }
-        if incoming.hlc < self.horizon()? {
-            return Ok(MergeOutcome::BeforeHorizon);
-        }
-        self.clock.observe(incoming.hlc);
         let txn = self.db.begin_write()?;
         let outcome = {
             let mut t = txn.open_table(RECORDS)?;
             let mut index = txn.open_table(BY_VERSION)?;
-            let current: Option<Record> = match t.get(incoming.key.as_str())? {
-                Some(v) => Some(serde_json::from_slice(v.value())?),
-                None => None,
-            };
-            let applied = match &current {
-                Some(cur) => incoming.wins_over(cur),
-                None => true,
-            };
-            if applied {
-                if let Some(cur) = &current {
-                    index.remove((cur.author.as_str(), cur.hlc.0))?;
+            let collected = txn.open_table(COLLECTED)?;
+            // A live record for a key whose tombstone we already collected,
+            // and which is not newer than that tombstone, is a stale copy
+            // from a peer that missed the delete. Refuse it.
+            let resurrecting = !incoming.deleted
+                && collected
+                    .get(incoming.key.as_str())?
+                    .map(|v| incoming.hlc.0 <= v.value())
+                    .unwrap_or(false);
+            let outcome = if skewed {
+                MergeOutcome::ClockSkew
+            } else if resurrecting {
+                MergeOutcome::Collected
+            } else {
+                let current: Option<Record> = match t.get(incoming.key.as_str())? {
+                    Some(v) => Some(serde_json::from_slice(v.value())?),
+                    None => None,
+                };
+                let applied = match &current {
+                    Some(cur) => incoming.wins_over(cur),
+                    None => true,
+                };
+                if applied {
+                    if let Some(cur) = &current {
+                        index.remove((cur.author.as_str(), cur.hlc.0))?;
+                    }
+                    t.insert(
+                        incoming.key.as_str(),
+                        serde_json::to_vec(incoming)?.as_slice(),
+                    )?;
+                    index.insert(
+                        (incoming.author.as_str(), incoming.hlc.0),
+                        incoming.key.as_str(),
+                    )?;
+                    MergeOutcome::Applied
+                } else {
+                    MergeOutcome::Superseded
                 }
-                t.insert(
-                    incoming.key.as_str(),
-                    serde_json::to_vec(incoming)?.as_slice(),
-                )?;
-                index.insert(
-                    (incoming.author.as_str(), incoming.hlc.0),
-                    incoming.key.as_str(),
-                )?;
-            }
+            };
+            // Advance the version vector even for rejected records, so the
+            // peer does not re-ship the same rejected version forever.
             let mut vv = txn.open_table(VV)?;
             let seen = vv
                 .get(incoming.author.as_str())?
@@ -333,11 +357,7 @@ impl Store {
             if incoming.hlc.0 > seen {
                 vv.insert(incoming.author.as_str(), incoming.hlc.0)?;
             }
-            if applied {
-                MergeOutcome::Applied
-            } else {
-                MergeOutcome::Superseded
-            }
+            outcome
         };
         txn.commit()?;
         if outcome == MergeOutcome::Applied {
@@ -355,7 +375,7 @@ impl Store {
             match self.merge_checked(r)? {
                 MergeOutcome::Applied => stats.applied += 1,
                 MergeOutcome::Superseded => stats.superseded += 1,
-                MergeOutcome::BeforeHorizon => stats.before_horizon += 1,
+                MergeOutcome::Collected => stats.collected += 1,
                 MergeOutcome::ClockSkew => stats.clock_skew += 1,
             }
         }
@@ -405,7 +425,14 @@ impl Store {
         Ok(out)
     }
 
-    /// Records older than this are refused on merge (see `gc`).
+    /// The HLC at which `key`'s tombstone was collected, if it was.
+    pub fn collected_at(&self, key: &str) -> Result<Option<Hlc>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(COLLECTED)?;
+        Ok(t.get(key)?.map(|v| Hlc(v.value())))
+    }
+
+    /// Wall-clock horizon of the last GC pass (0 if never run).
     pub fn horizon(&self) -> Result<Hlc> {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(META)?;
@@ -414,16 +441,19 @@ impl Store {
             .unwrap_or(Hlc::ZERO))
     }
 
-    /// Drop tombstones older than `horizon` and remember the horizon so
-    /// they cannot be resurrected by a late peer. Returns how many were
-    /// removed. The horizon never moves backwards.
-    pub fn gc(&self, horizon: Hlc) -> Result<usize> {
+    /// Drop tombstones older than `horizon`, remembering only (key, hlc) so
+    /// a stale live copy of that key cannot come back. Entries in that
+    /// memory older than `forget` are dropped too; `forget` should be far
+    /// longer than any node is expected to stay away. Returns how many
+    /// tombstones were removed. The horizon never moves backwards.
+    pub fn gc(&self, horizon: Hlc, forget: Hlc) -> Result<usize> {
         let horizon = horizon.max(self.horizon()?);
         let txn = self.db.begin_write()?;
         let mut removed = 0;
         {
             let mut records = txn.open_table(RECORDS)?;
             let mut index = txn.open_table(BY_VERSION)?;
+            let mut collected = txn.open_table(COLLECTED)?;
             let mut victims: Vec<(String, String, u64)> = Vec::new();
             for row in records.iter()? {
                 let (k, v) = row?;
@@ -435,7 +465,18 @@ impl Store {
             for (key, author, hlc) in victims {
                 records.remove(key.as_str())?;
                 index.remove((author.as_str(), hlc))?;
+                collected.insert(key.as_str(), hlc)?;
                 removed += 1;
+            }
+            let mut forgotten: Vec<String> = Vec::new();
+            for row in collected.iter()? {
+                let (k, v) = row?;
+                if Hlc(v.value()) < forget {
+                    forgotten.push(k.value().to_string());
+                }
+            }
+            for k in forgotten {
+                collected.remove(k.as_str())?;
             }
             let mut meta = txn.open_table(META)?;
             meta.insert(META_HORIZON, horizon.0)?;
@@ -596,25 +637,90 @@ mod tests {
             ..tomb.clone()
         };
         let horizon = Hlc(tomb.hlc.0 + 1);
-        assert_eq!(a.gc(horizon).unwrap(), 1);
+        assert_eq!(a.gc(horizon, Hlc::ZERO).unwrap(), 1);
         assert!(a.get_raw("gone").unwrap().is_none(), "tombstone collected");
+        assert_eq!(a.collected_at("gone").unwrap(), Some(tomb.hlc));
         assert_eq!(
             a.get("keep").unwrap().unwrap(),
             live,
             "live records untouched"
         );
-        assert_eq!(a.horizon().unwrap(), horizon);
         assert_eq!(
             a.merge_checked(&stale).unwrap(),
-            MergeOutcome::BeforeHorizon,
-            "a late copy older than the horizon must not come back"
+            MergeOutcome::Collected,
+            "a stale copy older than the collected tombstone must not come back"
         );
         assert!(a.get("gone").unwrap().is_none());
+        // ...but a genuinely newer write to the same key is fine
+        let recreated = Record {
+            hlc: Hlc(tomb.hlc.0 + 5),
+            deleted: false,
+            value: json!("new life"),
+            author: "b".into(),
+            ..tomb.clone()
+        };
+        assert_eq!(a.merge_checked(&recreated).unwrap(), MergeOutcome::Applied);
         // b never GC'd, so it still accepts the stale record normally
         assert!(b.merge(&stale).unwrap());
         // horizon never moves backwards
-        a.gc(Hlc::ZERO).unwrap();
+        a.gc(Hlc::ZERO, Hlc::ZERO).unwrap();
         assert_eq!(a.horizon().unwrap(), horizon);
+    }
+
+    #[test]
+    fn gc_never_blocks_keys_that_were_not_deleted() {
+        // A node that was away (or is brand new) must still receive old
+        // records for keys nobody deleted, even after GC ran locally.
+        let a = Store::in_memory("a").unwrap();
+        let b = Store::in_memory_with_clock("b", Arc::new(Clock::with_wall(|| 1_000))).unwrap();
+        let old = b.put("solo", json!("from long ago")).unwrap();
+        a.put("x", json!(1)).unwrap();
+        a.delete("x").unwrap();
+        a.gc(Hlc::from_parts(crate::now_ms(), 0), Hlc::ZERO)
+            .unwrap();
+        assert_eq!(a.merge_checked(&old).unwrap(), MergeOutcome::Applied);
+        assert_eq!(
+            a.get("solo").unwrap().unwrap().value,
+            json!("from long ago")
+        );
+    }
+
+    #[test]
+    fn collected_markers_are_forgotten_after_the_forget_horizon() {
+        let a = Store::in_memory("a").unwrap();
+        a.put("gone", json!(1)).unwrap();
+        let tomb = a.delete("gone").unwrap().unwrap();
+        a.gc(Hlc(tomb.hlc.0 + 1), Hlc::ZERO).unwrap();
+        assert!(a.collected_at("gone").unwrap().is_some());
+        a.gc(Hlc(tomb.hlc.0 + 1), Hlc(tomb.hlc.0 + 1)).unwrap();
+        assert!(a.collected_at("gone").unwrap().is_none());
+    }
+
+    #[test]
+    fn rejected_merges_still_advance_the_version_vector() {
+        let a = Store::in_memory("a").unwrap();
+        a.put("gone", json!(1)).unwrap();
+        let tomb = a.delete("gone").unwrap().unwrap();
+        a.gc(Hlc(tomb.hlc.0 + 1), Hlc::ZERO).unwrap();
+        let stale = Record {
+            key: "gone".into(),
+            value: json!("zombie"),
+            author: "c".into(),
+            hlc: Hlc(tomb.hlc.0 - 1),
+            deleted: false,
+        };
+        assert_eq!(a.merge_checked(&stale).unwrap(), MergeOutcome::Collected);
+        assert_eq!(
+            a.version_vector().unwrap().get("c").copied(),
+            Some(stale.hlc)
+        );
+        // so a peer holding only that record has nothing left to ship
+        let c = Store::in_memory("c").unwrap();
+        c.merge(&stale).unwrap();
+        assert!(c
+            .delta_since(&a.version_vector().unwrap())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -675,7 +781,7 @@ mod tests {
         let (last, horizon) = {
             let s = Store::open(&path, "a").unwrap();
             let r = s.put("k", json!(1)).unwrap();
-            s.gc(Hlc(5)).unwrap();
+            s.gc(Hlc(5), Hlc::ZERO).unwrap();
             (r.hlc, s.horizon().unwrap())
         };
         let s = Store::open(&path, "a").unwrap();

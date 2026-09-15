@@ -58,10 +58,21 @@ pub struct ExecRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ExecFrame {
-    Stdout { data: String },
-    Stderr { data: String },
-    Exit { code: Option<i32> },
-    Error { message: String },
+    Stdout {
+        data: String,
+    },
+    Stderr {
+        data: String,
+    },
+    Exit {
+        code: Option<i32>,
+    },
+    Error {
+        message: String,
+    },
+    /// Sent every few seconds while the process is silent so clients can
+    /// tell a quiet job from a dead connection.
+    Keepalive,
 }
 
 /// One node's view of the fleet, as returned by `/v1/status`.

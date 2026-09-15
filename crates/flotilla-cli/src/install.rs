@@ -134,6 +134,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
   <key>ProgramArguments</key><array><string>{daemon}</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>2</integer>
   <key>ProcessType</key><string>Background</string>
   <key>EnvironmentVariables</key>
   <dict>

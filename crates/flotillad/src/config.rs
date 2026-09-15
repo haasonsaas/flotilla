@@ -22,9 +22,11 @@ pub struct Config {
     /// Path to the tailscale CLI. Auto-detected if unset.
     pub tailscale_bin: Option<PathBuf>,
     pub max_concurrent_jobs: usize,
-    /// Tombstones older than this are collected, and records older than
-    /// the collection horizon are refused on merge.
+    /// Tombstones older than this are collected. Peers that have not
+    /// synced within this window may keep a stale copy of a deleted key.
     pub gc_horizon_days: u64,
+    /// How long to remember collected keys so stale copies stay rejected.
+    pub gc_forget_days: u64,
     /// Finished jobs (spec, claim, result, local log) are removed after this.
     pub job_retention_hours: u64,
     /// Records stamped further in the future than this are refused.
@@ -86,7 +88,8 @@ impl Default for Config {
             labels: Labels::new(),
             tailscale_bin: None,
             max_concurrent_jobs: 2,
-            gc_horizon_days: 7,
+            gc_horizon_days: 30,
+            gc_forget_days: 365,
             job_retention_hours: 72,
             max_clock_skew_secs: 3600,
             job_lease_secs: 60,

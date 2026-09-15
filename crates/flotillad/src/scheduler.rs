@@ -143,6 +143,16 @@ fn start(state: AppState, spec: JobSpec, settle: bool) {
         }
         tracing::info!(job = %id, cmd = ?spec.cmd, "running");
         match execute(&state, &spec, cancel).await {
+            Outcome::Finished(_)
+                if state
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                tracing::info!(job = %id, "killed by shutdown; claim left for resume or takeover");
+            }
+            Outcome::Finished(_) if state.store.get(&keys::job(&id)).ok().flatten().is_none() => {
+                tracing::info!(job = %id, "job was removed while running; not writing a result");
+            }
             Outcome::Finished(result) => {
                 if let Err(e) = state.store.put_json(&keys::result(&id), &result) {
                     tracing::error!(job = %id, error = %e, "writing result");
@@ -227,6 +237,7 @@ async fn execute(state: &AppState, spec: &JobSpec, cancel: CancellationToken) ->
             }
             ExecFrame::Error { message } => error = Some(message.clone()),
             ExecFrame::Exit { code } => exit = *code,
+            ExecFrame::Keepalive => {}
         }
     }
     keeper.abort();

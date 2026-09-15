@@ -166,6 +166,23 @@ This is at-least-once: a node partitioned for longer than the settle window can
 also run the job, and a takeover can overlap with an executor that is alive but
 unreachable. That's the trade for having no coordinator.
 
+A daemon that is stopped (SIGTERM, `launchctl kickstart -k`, `systemctl
+restart`) kills its running jobs' process groups and leaves their claims in
+place, so it resumes them itself on restart or another node takes them over
+once the lease lapses. No result is written for a job interrupted this way.
+
+## Store hygiene
+
+Deleted records become tombstones so the delete replicates. After
+`gc_horizon_days` (default 30) a tombstone is collected down to a `(key, hlc)`
+marker; a stale live copy of that key arriving later from a node that missed
+the delete is refused instead of resurrecting it, while keys that were never
+deleted are never affected, so a node that was away for months, or a new
+node, still converges. Markers are forgotten after `gc_forget_days` (365).
+Records stamped more than `max_clock_skew_secs` (3600) in the future are
+refused, so one machine with a wrong clock cannot win every write. Finished
+jobs are retired after `job_retention_hours` (72).
+
 ## Layout
 
 - `crates/flotilla-core`: clock, record, store, sync, schemas, selectors, API types. No network.
