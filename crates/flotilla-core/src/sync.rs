@@ -9,7 +9,7 @@
 //! them to HTTP and the tests call them directly.
 
 use crate::record::Record;
-use crate::store::{Result, Store, VersionVector};
+use crate::store::{MergeStats, Result, Store, VersionVector};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -38,12 +38,12 @@ pub fn open(store: &Store) -> Result<SyncMessage> {
 }
 
 /// Requester side, step 2: merge the reply and build the push (may be empty).
-/// Returns (records applied locally, push message).
-pub fn close(store: &Store, reply: &SyncMessage) -> Result<(usize, SyncMessage)> {
-    let applied = store.merge_all(&reply.records)?;
+/// Returns (merge stats for the pulled records, push message).
+pub fn close(store: &Store, reply: &SyncMessage) -> Result<(MergeStats, SyncMessage)> {
+    let stats = store.merge_all(&reply.records)?;
     let push = store.delta_since(&reply.vv)?;
     Ok((
-        applied,
+        stats,
         SyncMessage {
             vv: store.version_vector()?,
             records: push,
@@ -55,12 +55,12 @@ pub fn close(store: &Store, reply: &SyncMessage) -> Result<(usize, SyncMessage)>
 pub fn sync_pair(requester: &Store, responder: &Store) -> Result<(usize, usize)> {
     let first = open(requester)?;
     let reply = respond(responder, &first)?;
-    let (pulled, push) = close(requester, &reply)?;
+    let (stats, push) = close(requester, &reply)?;
     let pushed = push.records.len();
     if pushed > 0 {
         respond(responder, &push)?;
     }
-    Ok((pulled, pushed))
+    Ok((stats.applied, pushed))
 }
 
 #[cfg(test)]
