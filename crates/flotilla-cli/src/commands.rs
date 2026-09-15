@@ -72,8 +72,13 @@ pub async fn events(c: &Client, prefix: &str) -> Result<()> {
     while let Some(ev) = stream.next().await {
         let ev = ev?;
         let mut o = out.lock();
-        writeln!(o, "{}", serde_json::to_string(&ev)?)?;
-        o.flush()?;
+        let written = writeln!(o, "{}", serde_json::to_string(&ev)?).and_then(|_| o.flush());
+        if let Err(e) = written {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(()); // reader (e.g. `head`) went away
+            }
+            return Err(e.into());
+        }
     }
     Ok(())
 }
@@ -778,6 +783,7 @@ async fn job_ls_once(c: &Client, hours: u64, json: bool) -> Result<()> {
 
 async fn wait(c: &Client, id: &str, json: bool) -> Result<()> {
     let mut last_state = None;
+    let mut cancelled_polls = 0;
     loop {
         let spec: JobSpec = c
             .get_record(&keys::job(id))
@@ -816,7 +822,12 @@ async fn wait(c: &Client, id: &str, json: bool) -> Result<()> {
             std::process::exit(r.exit_code.unwrap_or(1));
         }
         if state == JobState::Cancelled {
-            bail!("job cancelled before it ran");
+            if claim.is_some() && cancelled_polls < 15 {
+                // the executor will write a result once it has killed the process
+                cancelled_polls += 1;
+            } else {
+                bail!("job cancelled before it ran");
+            }
         }
         pause(Duration::from_secs(2)).await;
     }
@@ -1262,6 +1273,9 @@ async fn run_remote_install_env(
                 eprint!("[{name}] {data}");
             }
             Ok(ExecFrame::Exit { code: Some(0) }) => return Ok(()),
+            // The daemon restarts itself during install, which ends the
+            // exec without a status; `wait_for_version` verifies the result.
+            Ok(ExecFrame::Exit { code: None }) if saw_output => return Ok(()),
             Ok(ExecFrame::Exit { code }) => bail!("install exited with {code:?}"),
             Ok(ExecFrame::Error { message }) => bail!("install error: {message}"),
             Err(_) if saw_output => return Ok(()),

@@ -122,6 +122,21 @@ fn xcode_version() -> Option<String> {
         .clone()
 }
 
+fn ifconfig_mac(iface: &str) -> Option<String> {
+    let out = std::process::Command::new("ifconfig")
+        .arg(iface)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("ether ")
+                .map(|m| m.split_whitespace().next().unwrap_or("").to_lowercase())
+        })
+        .filter(|m| m.len() == 17 && m != "02:00:00:00:00:00")
+}
+
 /// Physical-looking interfaces with a private IPv4 and a real MAC.
 pub fn lan_interfaces() -> Vec<flotilla_core::schema::LanInterface> {
     let nets = sysinfo::Networks::new_with_refreshed_list();
@@ -136,9 +151,14 @@ pub fn lan_interfaces() -> Vec<flotilla_core::schema::LanInterface> {
         {
             continue;
         }
-        let mac = data.mac_address();
-        if mac.0 == [0; 6] {
-            continue;
+        let mut mac = data.mac_address().to_string().to_lowercase();
+        if mac == "00:00:00:00:00:00" || mac == "02:00:00:00:00:00" {
+            // macOS reports a placeholder to unentitled processes; ifconfig
+            // still prints the real one.
+            match ifconfig_mac(name) {
+                Some(real) => mac = real,
+                None => continue,
+            }
         }
         for net in data.ip_networks() {
             if let std::net::IpAddr::V4(v4) = net.addr {
@@ -147,7 +167,7 @@ pub fn lan_interfaces() -> Vec<flotilla_core::schema::LanInterface> {
                         name: name.clone(),
                         ip: v4.to_string(),
                         prefix: net.prefix,
-                        mac: mac.to_string().to_lowercase(),
+                        mac: mac.clone(),
                     });
                 }
             }

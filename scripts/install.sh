@@ -20,7 +20,11 @@ case "$os-$arch" in
 esac
 
 if [ -z "$version" ]; then
-  version=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+  version=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+  if [ -z "$version" ]; then
+    # /releases/latest lags a freshly published release; fall back to the newest tag
+    version=$(curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=5" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+  fi
   [ -n "$version" ] || { echo "could not determine latest release" >&2; exit 1; }
 fi
 
