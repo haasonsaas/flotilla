@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
@@ -96,7 +96,9 @@ impl IdentityProvider {
 
 pub struct Tailscale {
     bin: PathBuf,
-    status_cache: Mutex<Option<(Instant, Value)>>,
+    status_cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    /// Set while a background refresh of the status cache is in flight.
+    refreshing: Arc<std::sync::atomic::AtomicBool>,
     whois_cache: Mutex<HashMap<IpAddr, (Instant, Option<WhoIs>)>>,
 }
 
@@ -115,16 +117,24 @@ impl Tailscale {
         };
         Ok(Tailscale {
             bin,
-            status_cache: Mutex::new(None),
+            status_cache: Arc::new(Mutex::new(None)),
+            refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             whois_cache: Mutex::new(HashMap::new()),
         })
     }
 
     async fn run(&self, args: &[&str]) -> Result<Value> {
-        let out = tokio::time::timeout(CLI_TIMEOUT, Command::new(&self.bin).args(args).output())
+        run_cli(&self.bin, args).await
+    }
+}
+
+/// One `tailscale` invocation, bounded by CLI_TIMEOUT.
+async fn run_cli(bin: &std::path::Path, args: &[&str]) -> Result<Value> {
+    {
+        let out = tokio::time::timeout(CLI_TIMEOUT, Command::new(bin).args(args).output())
             .await
             .with_context(|| format!("tailscale {:?} timed out after {:?}", args, CLI_TIMEOUT))?
-            .with_context(|| format!("running {}", self.bin.display()))?;
+            .with_context(|| format!("running {}", bin.display()))?;
         if !out.status.success() {
             bail!(
                 "tailscale {:?} failed: {}",
@@ -135,28 +145,47 @@ impl Tailscale {
         serde_json::from_slice(&out.stdout)
             .with_context(|| format!("parsing tailscale {:?} output", args))
     }
+}
 
+impl Tailscale {
+    /// The peer list, never blocking on the tailscale CLI once we have one:
+    /// a stale cache is returned immediately and refreshed in the
+    /// background. Only the very first call (no cache yet) waits.
     async fn status(&self) -> Result<Value> {
-        if let Some((at, v)) = self.status_cache.lock().unwrap().as_ref() {
-            if at.elapsed() < STATUS_TTL {
-                return Ok(v.clone());
+        let cached = self.status_cache.lock().unwrap().clone();
+        match cached {
+            Some((at, v)) if at.elapsed() < STATUS_TTL => Ok(v),
+            Some((at, v)) => {
+                self.refresh_in_background(at.elapsed());
+                Ok(v)
             }
-        }
-        match self.run(&["status", "--json"]).await {
-            Ok(v) => {
+            None => {
+                let v = run_cli(&self.bin, &["status", "--json"]).await?;
                 *self.status_cache.lock().unwrap() = Some((Instant::now(), v.clone()));
                 Ok(v)
             }
-            Err(e) => {
-                // Serve the last known peer list rather than failing every
-                // request while the CLI is slow; it refreshes next call.
-                if let Some((_, v)) = self.status_cache.lock().unwrap().as_ref() {
-                    tracing::warn!(error = %e, "tailscale status failed; using cached peer list");
-                    return Ok(v.clone());
-                }
-                Err(e)
-            }
         }
+    }
+
+    fn refresh_in_background(&self, age: Duration) {
+        use std::sync::atomic::Ordering;
+        if self.refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let bin = self.bin.clone();
+        let cache = self.status_cache.clone();
+        let flag = self.refreshing.clone();
+        tokio::spawn(async move {
+            match run_cli(&bin, &["status", "--json"]).await {
+                Ok(v) => *cache.lock().unwrap() = Some((Instant::now(), v)),
+                Err(e) => {
+                    if age > STATUS_TTL * 6 {
+                        tracing::warn!(error = %e, age_s = age.as_secs(), "tailscale status keeps failing; peer list is stale");
+                    }
+                }
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
     }
 
     pub async fn me(&self) -> Result<NodeInfo> {
@@ -437,7 +466,8 @@ mod tests {
         });
         let ts = Tailscale {
             bin: PathBuf::from("/bin/false"),
-            status_cache: Mutex::new(Some((Instant::now(), v))),
+            status_cache: Arc::new(Mutex::new(Some((Instant::now(), v)))),
+            refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             whois_cache: Mutex::new(HashMap::new()),
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
