@@ -44,6 +44,42 @@ pub struct NodeFacts {
     /// Empty on nodes older than multi-tailnet support.
     #[serde(default)]
     pub tailnets: Vec<TailnetInfo>,
+    /// Build caches this node holds warm, by name (`[[warm_cache]]` in the
+    /// node's config). Absent when the cache directory does not exist.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub warm: BTreeMap<String, WarmCache>,
+}
+
+/// One warm build cache on a node.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WarmCache {
+    /// What the cache was built from, e.g. a short commit hash. Empty when
+    /// the node has no `key_cmd` for it.
+    pub key: String,
+    pub path: String,
+    /// Approximate size on disk, refreshed every few minutes.
+    pub size_mb: u64,
+    /// Unix ms of the newest change under the cache directory.
+    pub last_used_ms: u64,
+    /// Seconds between `last_used_ms` and when these facts were written.
+    pub age_secs: u64,
+}
+
+impl WarmCache {
+    /// The `warm.<name>` label value: `<key>@<age>`, e.g. `3fa9c1e@12m`.
+    pub fn label_value(&self) -> String {
+        let key = if self.key.is_empty() { "-" } else { &self.key };
+        format!("{key}@{}", human_age(self.age_secs))
+    }
+}
+
+pub fn human_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
 }
 
 /// One node's presence on one tailnet. `node_id` is the id the tailnet's
@@ -127,6 +163,17 @@ pub struct JobSpec {
     /// Why the job was cancelled, when the fleet did it (dependency failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<String>,
+    /// Affinity placement: among eligible nodes prefer the one holding this
+    /// warm cache (`warm` in its facts), freshest first, then least loaded.
+    /// Nodes at their `max_jobs` cap are passed over. Falls back to plain
+    /// least-load when no eligible node holds the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_warm: Option<String>,
+    /// With `prefer_warm`: the cache key the job wants (e.g. a commit). A
+    /// node whose key equals it, or is a prefix of it or extends it, wins
+    /// over a merely fresher cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_key: Option<String>,
 }
 
 /// `claim/<id>`: written by a node that intends to run the job.
@@ -309,6 +356,8 @@ mod tests {
             retries: 0,
             retry: 0,
             cancel_reason: None,
+            prefer_warm: None,
+            warm_key: None,
         }
     }
 
@@ -426,5 +475,30 @@ mod tests {
         };
         let back: NodeFacts = serde_json::from_value(serde_json::to_value(&f).unwrap()).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn warm_label_value_formats_key_and_age() {
+        let mut w = WarmCache {
+            key: "3fa9c1e".into(),
+            age_secs: 720,
+            ..Default::default()
+        };
+        assert_eq!(w.label_value(), "3fa9c1e@12m");
+        w.key.clear();
+        w.age_secs = 5;
+        assert_eq!(w.label_value(), "-@5s");
+        assert_eq!(human_age(7200), "2h");
+        assert_eq!(human_age(3 * 86400), "3d");
+    }
+
+    #[test]
+    fn facts_without_warm_deserialize() {
+        let f = NodeFacts::default();
+        let mut v = serde_json::to_value(&f).unwrap();
+        assert!(v.get("warm").is_none(), "empty warm is not serialized");
+        v.as_object_mut().unwrap().remove("warm");
+        let back: NodeFacts = serde_json::from_value(v).unwrap();
+        assert!(back.warm.is_empty());
     }
 }

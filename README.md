@@ -243,6 +243,19 @@ apply = ["brew", "install", "jq"]
 4. The winner runs the job, streams the log to a local file, and writes `result/<id>` with the exit code and the last 4 KiB of output.
 5. `job show` reads the result from any node. `job logs` fetches the full log from the executor.
 
+Affinity placement: `flotilla job submit --prefer-warm mono-rust [--warm-key <commit>] -- ...`
+(job fields `prefer_warm`, `warm_key`) ranks the eligible nodes by warm cache
+(a cache whose key equals, prefixes or extends `--warm-key` first, then the
+most recently used), then least load per cpu, then node id. Nodes with no such
+cache rank last, so with no warm node the job behaves like `--pick least-load`.
+Every node applies the same rule to the same replicated facts and only the
+winner claims, so there is still no leader. A node never runs more than
+`max_concurrent_jobs` (default 2) jobs, and peers skip a node that is at that
+cap, published as the `max_jobs` label, when ranking. Ranking uses facts up to
+a minute old, so a node can claim slightly past what a peer expects; the
+claim's last-writer-wins settles it as before. Warm caches come from
+`[[warm_cache]]` config (see above).
+
 Every job gets `FLOTILLA_ARTIFACTS` (a directory on the executor),
 `FLOTILLA_JOB_ID` and `FLOTILLA_NODE` in its environment. Whatever it writes
 under the artifacts directory is listed by `/v1/jobs/{id}/artifacts` and

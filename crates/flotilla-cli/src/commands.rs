@@ -504,6 +504,13 @@ pub struct SubmitArgs {
     /// Placement: `least-load` picks the least loaded eligible node
     #[arg(long)]
     pick: Option<String>,
+    /// Prefer the node holding this warm build cache (freshest first, then
+    /// least loaded), e.g. `mono-rust`
+    #[arg(long = "prefer-warm")]
+    prefer_warm: Option<String>,
+    /// With --prefer-warm: the cache key wanted (e.g. a commit hash)
+    #[arg(long = "warm-key", requires = "prefer_warm")]
+    warm_key: Option<String>,
     /// Run inside a detached tmux session of this name on the executor
     #[arg(long)]
     tmux: Option<String>,
@@ -641,6 +648,8 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
                 retries: a.retries,
                 retry: 0,
                 cancel_reason: None,
+                prefer_warm: a.prefer_warm,
+                warm_key: a.warm_key,
             };
             c.put_json(&keys::job(&spec.id), &spec).await?;
             if json && !a.wait {
@@ -689,6 +698,12 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
             }
             if let Some(pick) = &j.spec.pick {
                 println!("placement: {pick}");
+            }
+            if let Some(w) = &j.spec.prefer_warm {
+                match &j.spec.warm_key {
+                    Some(k) => println!("prefer:    warm {w} at {k}"),
+                    None => println!("prefer:    warm {w}"),
+                }
             }
             if !j.spec.after.is_empty() {
                 println!(
@@ -1925,6 +1940,8 @@ pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
                 retries: 0,
                 retry: 0,
                 cancel_reason: None,
+                prefer_warm: None,
+                warm_key: None,
             };
             c.put_json(&keys::job(&id), &spec).await?;
             if json && !a.wait {
@@ -2175,6 +2192,8 @@ pub async fn batch(c: &Client, cmd: BatchCmd, _json: bool) -> Result<()> {
                     retries: a.retries,
                     retry: 0,
                     cancel_reason: None,
+                    prefer_warm: None,
+                    warm_key: None,
                 };
                 c.put_json(&keys::job(&spec.id), &spec).await?;
                 ids.push(spec.id);
@@ -2203,6 +2222,8 @@ pub async fn batch(c: &Client, cmd: BatchCmd, _json: bool) -> Result<()> {
                     retries: 0,
                     retry: 0,
                     cancel_reason: None,
+                    prefer_warm: None,
+                    warm_key: None,
                 };
                 c.put_json(&keys::job(&spec.id), &spec).await?;
             }

@@ -325,6 +325,8 @@ async fn job_is_claimed_run_on_selected_node_and_result_replicates() {
         retries: 0,
         retry: 0,
         cancel_reason: None,
+        prefer_warm: None,
+        warm_key: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
 
@@ -400,6 +402,8 @@ async fn job_cancel_kills_running_process() {
         retries: 0,
         retry: 0,
         cancel_reason: None,
+        prefer_warm: None,
+        warm_key: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("job running", || {
@@ -515,6 +519,8 @@ async fn expired_lease_is_taken_over() {
         retries: 0,
         retry: 0,
         cancel_reason: None,
+        prefer_warm: None,
+        warm_key: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     // A claim from a node that died: lease already in the past.
@@ -589,6 +595,8 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
         retries: 0,
         retry: 0,
         cancel_reason: None,
+        prefer_warm: None,
+        warm_key: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -700,6 +708,8 @@ async fn gc_retires_old_jobs_and_keeps_recent() {
             retries: 0,
             retry: 0,
             cancel_reason: None,
+            prefer_warm: None,
+            warm_key: None,
         };
         let result = JobResult {
             job_id: id.into(),
@@ -872,6 +882,8 @@ async fn gc_keeps_cancelled_job_while_its_lease_is_live() {
         retries: 0,
         retry: 0,
         cancel_reason: None,
+        prefer_warm: None,
+        warm_key: None,
     };
     a.state.store.put_json(&keys::job("long"), &spec).unwrap();
     let claim = JobClaim {
@@ -928,6 +940,8 @@ async fn shutdown_leaves_claim_and_writes_no_result() {
         retries: 0,
         retry: 0,
         cancel_reason: None,
+        prefer_warm: None,
+        warm_key: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -984,6 +998,8 @@ fn spec_for(id: &str, cmd: &[&str]) -> JobSpec {
         retries: 0,
         retry: 0,
         cancel_reason: None,
+        prefer_warm: None,
+        warm_key: None,
     }
 }
 
@@ -1007,7 +1023,7 @@ async fn least_load_defers_to_a_less_loaded_peer() {
     let mut spec = spec_for(&uuid::Uuid::new_v4().to_string(), &["true"]);
     spec.pick = Some("least-load".into());
     a.state.store.put_json(&keys::job(&spec.id), &spec).unwrap();
-    pause(Duration::from_secs(4)).await;
+    pause(Duration::from_millis(2500)).await; // < the 4s facts freshness window
     assert!(
         a.state.store.get(&keys::claim(&spec.id)).unwrap().is_none(),
         "must leave it to the idle peer"
@@ -1022,6 +1038,117 @@ async fn least_load_defers_to_a_less_loaded_peer() {
         a.state.store.get(&keys::claim(&spec.id)).unwrap().is_some()
     })
     .await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A fresh fake peer holding a warm `mono-rust` cache.
+fn warm_peer(a: &Node, id: &str, load: f64, running: usize) -> NodeFacts {
+    let mut peer = a.state.my_facts().unwrap();
+    peer.node_id = format!("id-{id}");
+    peer.name = id.into();
+    peer.load_1m = load;
+    peer.cpus = 8;
+    peer.running_jobs = (0..running).map(|i| format!("busy-{i}")).collect();
+    peer.reported_at_ms = flotilla_core::now_ms();
+    peer.warm.insert(
+        "mono-rust".into(),
+        WarmCache {
+            key: "abc1234".into(),
+            last_used_ms: flotilla_core::now_ms(),
+            ..Default::default()
+        },
+    );
+    a.state
+        .store
+        .put_json(&keys::node_facts(&peer.node_id), &peer)
+        .unwrap();
+    peer
+}
+
+fn warm_spec() -> JobSpec {
+    let mut spec = spec_for(&uuid::Uuid::new_v4().to_string(), &["true"]);
+    spec.prefer_warm = Some("mono-rust".into());
+    spec
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefer_warm_leaves_the_job_to_a_busier_warm_node_then_falls_back() {
+    let dir = tmp();
+    let a = node("solo", free_port().await, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    // We are cold and idle; the peer is warm but more loaded.
+    let mut peer = warm_peer(&a, "warm", 6.0, 0);
+    let spec = warm_spec();
+    a.state.store.put_json(&keys::job(&spec.id), &spec).unwrap();
+    pause(Duration::from_millis(2500)).await; // < the 4s facts freshness window
+    assert!(
+        a.state.store.get(&keys::claim(&spec.id)).unwrap().is_none(),
+        "warm node wins over the less-loaded cold node"
+    );
+    // The warm node hits its cap (max_jobs defaults to 2): pass it over.
+    peer.running_jobs = vec!["x".into(), "y".into()];
+    peer.reported_at_ms = flotilla_core::now_ms();
+    a.state
+        .store
+        .put_json(&keys::node_facts(&peer.node_id), &peer)
+        .unwrap();
+    eventually("claimed once the warm node is full", || {
+        a.state.store.get(&keys::claim(&spec.id)).unwrap().is_some()
+    })
+    .await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefer_warm_falls_back_when_the_warm_node_goes_quiet() {
+    let dir = tmp();
+    let a = node("solo", free_port().await, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let mut peer = warm_peer(&a, "warm", 0.0, 0);
+    let spec = warm_spec();
+    a.state.store.put_json(&keys::job(&spec.id), &spec).unwrap();
+    pause(Duration::from_millis(2500)).await; // < the 4s facts freshness window
+    assert!(a.state.store.get(&keys::claim(&spec.id)).unwrap().is_none());
+    peer.reported_at_ms = 1;
+    a.state
+        .store
+        .put_json(&keys::node_facts(&peer.node_id), &peer)
+        .unwrap();
+    eventually("claimed once the warm node is stale", || {
+        a.state.store.get(&keys::claim(&spec.id)).unwrap().is_some()
+    })
+    .await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefer_warm_respects_the_per_node_cap() {
+    let dir = tmp();
+    let a = node("solo", free_port().await, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    // No warm peers anywhere: plain placement, but never above the cap of 2.
+    let specs: Vec<JobSpec> = (0..3)
+        .map(|_| {
+            let mut s = warm_spec();
+            s.cmd = vec!["sleep".into(), "30".into()];
+            s.timeout_secs = Some(30);
+            s
+        })
+        .collect();
+    for s in &specs {
+        a.state.store.put_json(&keys::job(&s.id), s).unwrap();
+    }
+    pause(Duration::from_secs(6)).await;
+    let claimed = specs
+        .iter()
+        .filter(|s| a.state.store.get(&keys::claim(&s.id)).unwrap().is_some())
+        .count();
+    assert_eq!(claimed, 2, "third job waits for a free slot");
+    for s in &specs {
+        let mut c = s.clone();
+        c.cancelled = true;
+        a.state.store.put_json(&keys::job(&c.id), &c).unwrap();
+    }
     std::fs::remove_dir_all(dir).ok();
 }
 
