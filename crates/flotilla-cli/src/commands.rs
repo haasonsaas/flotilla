@@ -1507,11 +1507,22 @@ pub enum SessionCmd {
         /// Only this node
         #[arg(short = 'n', long = "node")]
         node: Option<String>,
+        /// Only nodes matching these labels
+        #[arg(short = 'l', long = "selector")]
+        selector: Option<Selector>,
+        /// Every node's sessions (the default; kept so scripts can say so)
+        #[arg(long)]
+        all: bool,
     },
-    /// Start a detached tmux session on a node, optionally running a command
+    /// Start a detached tmux session, on a node you name or on the least-loaded eligible one
     Start {
+        /// Node to start on. Without it the least-loaded online node with tmux,
+        /// spare `max_sessions`, and matching labels is chosen.
         #[arg(short = 'n', long = "node")]
-        node: String,
+        node: Option<String>,
+        /// Label selector for placement, e.g. `role=build`
+        #[arg(short = 'l', long = "selector")]
+        selector: Option<Selector>,
         /// Session name
         #[arg(long)]
         name: String,
@@ -1527,8 +1538,9 @@ pub enum SessionCmd {
     },
     /// Type text into a session (followed by Enter unless --no-enter)
     Send {
+        /// Node (default: whichever node has a session with this name)
         #[arg(short = 'n', long = "node")]
-        node: String,
+        node: Option<String>,
         name: String,
         #[arg(long)]
         no_enter: bool,
@@ -1538,7 +1550,7 @@ pub enum SessionCmd {
     /// Print the last lines of a session's active pane
     Tail {
         #[arg(short = 'n', long = "node")]
-        node: String,
+        node: Option<String>,
         name: String,
         #[arg(long, default_value_t = 50)]
         lines: u32,
@@ -1546,18 +1558,33 @@ pub enum SessionCmd {
     /// Kill a session
     Kill {
         #[arg(short = 'n', long = "node")]
-        node: String,
+        node: Option<String>,
         name: String,
     },
     /// Attach interactively over SSH (prints the command if ssh fails)
     Attach {
         #[arg(short = 'n', long = "node")]
-        node: String,
+        node: Option<String>,
         name: String,
         /// SSH user on the node (default: same as here)
         #[arg(long)]
         user: Option<String>,
     },
+}
+
+/// The node a session command runs on: the one named, else whichever node
+/// has a session called `name`.
+async fn session_node(c: &Client, node: Option<String>, name: &str) -> Result<String> {
+    match node {
+        Some(n) => Ok(n),
+        None => {
+            let st = c.status().await?;
+            Ok(crate::place::locate_session(&st.nodes, name)?
+                .facts
+                .name
+                .clone())
+        }
+    }
 }
 
 async fn find_node(c: &Client, name: &str) -> Result<(StatusResponse, NodeStatus)> {
@@ -1616,10 +1643,19 @@ async fn tmux(client: &Client, args: &[&str]) -> Result<String> {
 
 pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
     match cmd {
-        SessionCmd::Ls { node } => {
+        SessionCmd::Ls {
+            node,
+            selector,
+            all: _,
+        } => {
             let st = c.status().await?;
             let mut rows = Vec::new();
             for n in &st.nodes {
+                if let Some(sel) = &selector {
+                    if !sel.matches(&n.facts.labels) {
+                        continue;
+                    }
+                }
                 if let Some(want) = &node {
                     if &n.facts.name != want && &n.facts.node_id != want {
                         continue;
@@ -1658,11 +1694,28 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
         }
         SessionCmd::Start {
             node,
+            selector,
             name,
             cwd,
             env,
             cmd,
         } => {
+            let node = match node {
+                Some(n) => n,
+                None => {
+                    let st = c.status().await?;
+                    if let Ok(dup) = crate::place::locate_session(&st.nodes, &name) {
+                        bail!("session {name} already exists on {}", dup.facts.name);
+                    }
+                    if crate::place::nodes_with_session(&st.nodes, &name).len() > 1 {
+                        bail!("session {name} already exists on several nodes");
+                    }
+                    crate::place::pick_node(&st.nodes, &selector.unwrap_or_default())?
+                        .facts
+                        .name
+                        .clone()
+                }
+            };
             let (st, n) = find_node(c, &node).await?;
             let client = node_url(c, &st, &n)?;
             let mut args: Vec<String> =
@@ -1698,6 +1751,7 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
             no_enter,
             text,
         } => {
+            let node = session_node(c, node, &name).await?;
             let (st, n) = find_node(c, &node).await?;
             let client = node_url(c, &st, &n)?;
             let line = text.join(" ");
@@ -1709,6 +1763,7 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
             Ok(())
         }
         SessionCmd::Tail { node, name, lines } => {
+            let node = session_node(c, node, &name).await?;
             let (st, n) = find_node(c, &node).await?;
             let client = node_url(c, &st, &n)?;
             let start = format!("-{lines}");
@@ -1729,6 +1784,7 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
             Ok(())
         }
         SessionCmd::Kill { node, name } => {
+            let node = session_node(c, node, &name).await?;
             let (st, n) = find_node(c, &node).await?;
             let client = node_url(c, &st, &n)?;
             tmux(&client, &["kill-session", "-t", name.as_str()]).await?;
@@ -1736,6 +1792,7 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
             Ok(())
         }
         SessionCmd::Attach { node, name, user } => {
+            let node = session_node(c, node, &name).await?;
             let (st, n) = find_node(c, &node).await?;
             let ips = node_ips(&st, &n);
             let ip = ips
@@ -2067,7 +2124,16 @@ pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
             let name = spec
                 .tmux
                 .ok_or_else(|| anyhow!("job has no tmux session"))?;
-            session(c, SessionCmd::Attach { node, name, user }, json).await
+            session(
+                c,
+                SessionCmd::Attach {
+                    node: Some(node),
+                    name,
+                    user,
+                },
+                json,
+            )
+            .await
         }
         AgentCmd::Stop { id } => job(c, JobCmd::Cancel { id }, json).await,
     }

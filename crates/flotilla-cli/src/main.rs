@@ -4,6 +4,7 @@
 mod client;
 mod commands;
 mod install;
+mod place;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

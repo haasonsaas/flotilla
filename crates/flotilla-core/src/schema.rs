@@ -37,6 +37,9 @@ pub struct NodeFacts {
     /// tmux sessions on this node, for the sessions layer.
     #[serde(default)]
     pub sessions: Vec<SessionInfo>,
+    /// Cap on tmux sessions this node accepts from `session start` placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<usize>,
     /// Wired/wireless interfaces with a private IPv4, for wake-on-LAN.
     #[serde(default)]
     pub lan: Vec<LanInterface>,
