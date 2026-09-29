@@ -51,6 +51,8 @@ pub fn collect(state: &AppState, tailscale: Vec<TailnetHealth>) -> NodeFacts {
     labels.insert("os".into(), std::env::consts::OS.into());
     labels.insert("arch".into(), std::env::consts::ARCH.into());
     labels.insert("node".into(), state.me.name.clone());
+    // Peers read this to skip a node that is at its cap when placing jobs.
+    labels.insert("max_jobs".into(), state.cfg.max_concurrent_jobs.to_string());
     if let Some(x) = xcode_version() {
         labels.insert("xcode".into(), x);
     }
@@ -111,6 +113,7 @@ pub fn collect(state: &AppState, tailscale: Vec<TailnetHealth>) -> NodeFacts {
         reported_at_ms: flotilla_core::now_ms(),
         running_jobs: state.running_jobs(),
         sessions: tmux_sessions(),
+        max_sessions: state.cfg.max_sessions,
         lan: lan_interfaces(),
         tailnets: state.me.tailnets.clone(),
         warm,

@@ -8,6 +8,7 @@ mod facts;
 mod gc;
 mod identity;
 mod notify;
+mod placement;
 mod proxyproto;
 #[cfg(test)]
 mod recipes;

@@ -233,6 +233,9 @@ flotilla session start -n dev-desktop-1 --name codex --cwd ~/proj -- codex
 flotilla session tail -n dev-desktop-1 codex --lines 40
 flotilla session send -n dev-desktop-1 codex -- "run the tests"
 flotilla session attach -n dev-desktop-1 codex   # ssh -t ... tmux attach
+flotilla session start -l role=build --name grok1 -- grok    # no -n: least-loaded eligible node
+flotilla session ls --all                    # every node's sessions; -l narrows by label
+flotilla session tail grok1                  # send/tail/attach/kill find the node by session name
 flotilla wake mac-mini
 flotilla agent run --cwd ~/code/mono -- grok -p "resolve the conflict in PR 9138"
 flotilla agent ls                              # every agent run, node, elapsed, last output line
@@ -240,6 +243,14 @@ flotilla agent attach 3fa1                     # ssh -t into its tmux session on
 flotilla job submit --pick least-load -- cargo test   # any job can ask for the idlest node
 flotilla web                                   # open the dashboard; `flotilla web dev-desktop-1` opens that node's
 ```
+
+`session start` without `-n` picks the online node with tmux, matching `-l`
+labels, and fewer sessions than its `max_sessions` (config key, advertised in
+facts; unset means no cap). Among those it takes the lowest
+`(load_1m + 0.5 * sessions) / cpus`, so sessions that have just started and
+are still idle count against a node. It refuses a name already in use
+anywhere in the fleet, and `send`, `tail`, `attach` and `kill` without `-n`
+find the node holding that name (an error lists the nodes if several do).
 
 Agent runs are ordinary jobs with a `tmux` session name and the `least-load`
 placement hint. The executor starts the command in a detached tmux session
@@ -317,6 +328,19 @@ minutes.
 3. Each claimant waits one settle window (two sync intervals) and re-reads the claim. Last-writer-wins has picked exactly one record by then; everyone else stands down.
 4. The winner runs the job, streams the log to a local file, and writes `result/<id>` with the exit code and the last 4 KiB of output.
 5. `job show` reads the result from any node. `job logs` fetches the full log from the executor.
+
+Affinity placement: `flotilla job submit --prefer-warm mono-rust [--warm-key <commit>] -- ...`
+(job fields `prefer_warm`, `warm_key`) ranks the eligible nodes by warm cache
+(a cache whose key equals, prefixes or extends `--warm-key` first, then the
+most recently used), then least load per cpu, then node id. Nodes with no such
+cache rank last, so with no warm node the job behaves like `--pick least-load`.
+Every node applies the same rule to the same replicated facts and only the
+winner claims, so there is still no leader. A node never runs more than
+`max_concurrent_jobs` (default 2) jobs, and peers skip a node that is at that
+cap, published as the `max_jobs` label, when ranking. Ranking uses facts up to
+a minute old, so a node can claim slightly past what a peer expects; the
+claim's last-writer-wins settles it as before. Warm caches come from
+`[[warm_cache]]` config (see above).
 
 Every job gets `FLOTILLA_ARTIFACTS` (a directory on the executor),
 `FLOTILLA_JOB_ID` and `FLOTILLA_NODE` in its environment. Whatever it writes

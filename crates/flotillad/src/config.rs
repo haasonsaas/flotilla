@@ -22,6 +22,9 @@ pub struct Config {
     /// Path to the tailscale CLI. Auto-detected if unset.
     pub tailscale_bin: Option<PathBuf>,
     pub max_concurrent_jobs: usize,
+    /// Most tmux sessions `flotilla session start` may place here without
+    /// `-n`. Unset means no cap. Advertised in facts.
+    pub max_sessions: Option<usize>,
     /// Tombstones older than this are collected. Peers that have not
     /// synced within this window may keep a stale copy of a deleted key.
     pub gc_horizon_days: u64,
@@ -240,6 +243,7 @@ impl Default for Config {
             labels: Labels::new(),
             tailscale_bin: None,
             max_concurrent_jobs: 2,
+            max_sessions: None,
             gc_horizon_days: 30,
             gc_forget_days: 365,
             job_retention_hours: 72,

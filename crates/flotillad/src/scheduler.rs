@@ -149,11 +149,18 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         // Placement hint: with `least-load`, only the least loaded eligible
         // node (by the facts everyone replicates) claims. Ties break on node
         // id, and LWW on the claim still resolves any disagreement.
-        if spec.node.is_none()
-            && spec.pick.as_deref() == Some("least-load")
-            && !least_loaded(state, &spec, &facts)
-        {
-            continue;
+        if spec.node.is_none() {
+            if spec.prefer_warm.is_some() {
+                // Affinity: warm cache first (key match, then freshest),
+                // then least load; nodes at their cap are passed over.
+                if !preferred(state, &spec, &facts) {
+                    continue;
+                }
+            } else if spec.pick.as_deref() == Some("least-load")
+                && !least_loaded(state, &spec, &facts)
+            {
+                continue;
+            }
         }
         match current_claim(state, &spec.id) {
             Some(claim) if claim.node == state.me.node_id => {
@@ -478,6 +485,22 @@ fn least_loaded(state: &AppState, spec: &JobSpec, mine: &flotilla_core::schema::
         }
     }
     true
+}
+
+/// True if this node is the best for a `prefer_warm` job among the fresh
+/// nodes everyone sees (see `placement`).
+fn preferred(state: &AppState, spec: &JobSpec, mine: &flotilla_core::schema::NodeFacts) -> bool {
+    let now = flotilla_core::now_ms();
+    let fresh_ms = state.cfg.facts_interval_secs * 4 * 1000;
+    let Ok(records) = state.store.list(keys::NODE) else {
+        return true;
+    };
+    let others: Vec<_> = records
+        .into_iter()
+        .filter_map(|r| r.parse::<flotilla_core::schema::NodeFacts>().ok())
+        .filter(|o| now.saturating_sub(o.reported_at_ms) <= fresh_ms)
+        .collect();
+    crate::placement::should_claim(spec, mine, &others)
 }
 
 fn tmux_exit_path(state: &AppState, id: &str) -> std::path::PathBuf {
