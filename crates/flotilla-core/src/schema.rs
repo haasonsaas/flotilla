@@ -48,6 +48,66 @@ pub struct NodeFacts {
     /// node's config). Absent when the cache directory does not exist.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub warm: BTreeMap<String, WarmCache>,
+    /// Root plus every other mount of 50 GB or more, for the watchdog.
+    #[serde(default)]
+    pub disks: Vec<DiskInfo>,
+    /// `load_1m / cpus`.
+    #[serde(default)]
+    pub load_per_core: f64,
+    /// Running `cargo` and `rustc` processes.
+    #[serde(default)]
+    pub build_procs: u32,
+    /// Login state of each configured tailnet's tailscaled.
+    #[serde(default)]
+    pub tailscale: Vec<TailnetHealth>,
+}
+
+/// A mounted volume as reported by a node.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DiskInfo {
+    pub mount: String,
+    pub total_gb: u64,
+    pub free_gb: u64,
+}
+
+impl DiskInfo {
+    pub fn free_pct(&self) -> f64 {
+        if self.total_gb == 0 {
+            return 100.0;
+        }
+        self.free_gb as f64 * 100.0 / self.total_gb as f64
+    }
+}
+
+/// State of one tailnet's tailscaled: the `BackendState` from
+/// `tailscale status --json` (`Running`, `NeedsLogin`, `Stopped`, ...), or
+/// `unreachable` when the daemon did not answer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TailnetHealth {
+    pub name: String,
+    pub state: String,
+}
+
+/// `alert/<node id>/<alert id>`: written by a node about itself when a
+/// `[alerts]` threshold trips, and rewritten with `firing = false` when it
+/// clears.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    pub node_id: String,
+    pub node: String,
+    /// `disk_free`, `load`, or `tailscale`.
+    pub kind: String,
+    /// What it is about: a mount point or a tailnet name.
+    pub subject: String,
+    pub message: String,
+    pub firing: bool,
+    pub since_ms: u64,
+    pub updated_ms: u64,
+    /// When the node last sent a notification for this alert.
+    #[serde(default)]
+    pub notified_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ms: Option<u64>,
 }
 
 /// One warm build cache on a node.

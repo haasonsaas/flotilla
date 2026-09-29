@@ -43,6 +43,8 @@ pub struct Config {
     pub reconcile_interval_secs: u64,
     /// Optional push notifications (ntfy) for job outcomes on this node.
     pub notify: Option<NotifyConfig>,
+    /// Watchdog thresholds for this node's own health.
+    pub alerts: AlertsConfig,
     /// Extra listen addresses (host:port). Loopback and Tailscale IPs are always bound.
     pub listen: Vec<String>,
     /// Peers to sync with that may not be discoverable yet or that listen on a
@@ -150,6 +152,54 @@ pub struct NotifyConfig {
     pub token: Option<String>,
 }
 
+/// `[alerts]`: thresholds checked against this node's facts every facts
+/// interval. A tripped threshold writes an `alert/<node>/<id>` record and,
+/// if a destination is configured, POSTs once when it starts firing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertsConfig {
+    /// Fire when any tracked volume has less than this percent free.
+    /// 0 disables.
+    pub disk_free_pct_min: f64,
+    /// Fire when load per core exceeds this. 0 (default) disables.
+    pub load_per_core_max: f64,
+    /// Fire when a tailnet's tailscaled is logged out (NeedsLogin), stopped,
+    /// or does not answer.
+    pub tailscale_logged_out: bool,
+    /// Seconds a condition must persist before it fires, so a tailscaled
+    /// restart or a brief spike does not page anyone. Default 60.
+    pub for_secs: u64,
+    /// ntfy server; falls back to `[notify] ntfy_url`.
+    pub ntfy_url: Option<String>,
+    /// ntfy topic; falls back to `[notify] topic`.
+    pub topic: Option<String>,
+    /// ntfy token; falls back to `[notify] token`.
+    pub token: Option<String>,
+    /// URL that receives the alert record as JSON in a POST.
+    pub webhook_url: Option<String>,
+    /// Also send when an alert clears.
+    pub notify_resolved: bool,
+    /// Send again every this many hours while still firing. 0 sends once.
+    pub renotify_hours: u64,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        AlertsConfig {
+            disk_free_pct_min: 10.0,
+            load_per_core_max: 0.0,
+            tailscale_logged_out: true,
+            for_secs: 60,
+            ntfy_url: None,
+            topic: None,
+            token: None,
+            webhook_url: None,
+            notify_resolved: false,
+            renotify_hours: 0,
+        }
+    }
+}
+
 fn default_notify_on() -> Vec<String> {
     vec!["failed".into(), "lost".into()]
 }
@@ -201,6 +251,7 @@ impl Default for Config {
             scheduler_interval_secs: 3,
             reconcile_interval_secs: 60,
             notify: None,
+            alerts: AlertsConfig::default(),
             listen: Vec::new(),
             seeds: Vec::new(),
             name: None,
@@ -340,5 +391,25 @@ mod tests {
         let old: Config = toml::from_str("allowed_tags = [\"tag:x\"]").unwrap();
         assert!(old.tailnet.is_empty());
         assert_eq!(old.allow_lists(0).1, ["tag:x"]);
+    }
+
+    #[test]
+    fn parses_alerts_table() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [alerts]
+            disk_free_pct_min = 15
+            tailscale_logged_out = false
+            ntfy_url = "https://ntfy.sh"
+            topic = "fleet"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.alerts.disk_free_pct_min, 15.0);
+        assert!(!cfg.alerts.tailscale_logged_out);
+        assert_eq!(cfg.alerts.for_secs, 60);
+        let d: Config = toml::from_str("").unwrap();
+        assert_eq!(d.alerts.disk_free_pct_min, 10.0);
+        assert!(d.alerts.tailscale_logged_out);
     }
 }
