@@ -233,6 +233,9 @@ flotilla session start -n dev-desktop-1 --name codex --cwd ~/proj -- codex
 flotilla session tail -n dev-desktop-1 codex --lines 40
 flotilla session send -n dev-desktop-1 codex -- "run the tests"
 flotilla session attach -n dev-desktop-1 codex   # ssh -t ... tmux attach
+flotilla session start -l role=build --name grok1 -- grok    # no -n: least-loaded eligible node
+flotilla session ls --all                    # every node's sessions; -l narrows by label
+flotilla session tail grok1                  # send/tail/attach/kill find the node by session name
 flotilla wake mac-mini
 flotilla agent run --cwd ~/code/mono -- grok -p "resolve the conflict in PR 9138"
 flotilla agent ls                              # every agent run, node, elapsed, last output line
@@ -240,6 +243,14 @@ flotilla agent attach 3fa1                     # ssh -t into its tmux session on
 flotilla job submit --pick least-load -- cargo test   # any job can ask for the idlest node
 flotilla web                                   # open the dashboard; `flotilla web dev-desktop-1` opens that node's
 ```
+
+`session start` without `-n` picks the online node with tmux, matching `-l`
+labels, and fewer sessions than its `max_sessions` (config key, advertised in
+facts; unset means no cap). Among those it takes the lowest
+`(load_1m + 0.5 * sessions) / cpus`, so sessions that have just started and
+are still idle count against a node. It refuses a name already in use
+anywhere in the fleet, and `send`, `tail`, `attach` and `kill` without `-n`
+find the node holding that name (an error lists the nodes if several do).
 
 Agent runs are ordinary jobs with a `tmux` session name and the `least-load`
 placement hint. The executor starts the command in a detached tmux session

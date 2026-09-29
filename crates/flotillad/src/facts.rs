@@ -111,6 +111,7 @@ pub fn collect(state: &AppState, tailscale: Vec<TailnetHealth>) -> NodeFacts {
         reported_at_ms: flotilla_core::now_ms(),
         running_jobs: state.running_jobs(),
         sessions: tmux_sessions(),
+        max_sessions: state.cfg.max_sessions,
         lan: lan_interfaces(),
         tailnets: state.me.tailnets.clone(),
         warm,
