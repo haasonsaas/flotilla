@@ -338,6 +338,7 @@ async fn job_is_claimed_run_on_selected_node_and_result_replicates() {
         cancel_reason: None,
         prefer_warm: None,
         warm_key: None,
+        lock: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
 
@@ -415,6 +416,7 @@ async fn job_cancel_kills_running_process() {
         cancel_reason: None,
         prefer_warm: None,
         warm_key: None,
+        lock: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("job running", || {
@@ -532,6 +534,7 @@ async fn expired_lease_is_taken_over() {
         cancel_reason: None,
         prefer_warm: None,
         warm_key: None,
+        lock: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     // A claim from a node that died: lease already in the past.
@@ -608,6 +611,7 @@ async fn running_job_renews_lease_and_stops_when_claim_is_lost() {
         cancel_reason: None,
         prefer_warm: None,
         warm_key: None,
+        lock: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -721,6 +725,7 @@ async fn gc_retires_old_jobs_and_keeps_recent() {
             cancel_reason: None,
             prefer_warm: None,
             warm_key: None,
+            lock: None,
         };
         let result = JobResult {
             job_id: id.into(),
@@ -895,6 +900,7 @@ async fn gc_keeps_cancelled_job_while_its_lease_is_live() {
         cancel_reason: None,
         prefer_warm: None,
         warm_key: None,
+        lock: None,
     };
     a.state.store.put_json(&keys::job("long"), &spec).unwrap();
     let claim = JobClaim {
@@ -953,6 +959,7 @@ async fn shutdown_leaves_claim_and_writes_no_result() {
         cancel_reason: None,
         prefer_warm: None,
         warm_key: None,
+        lock: None,
     };
     a.state.store.put_json(&keys::job(&id), &spec).unwrap();
     eventually("claimed", || {
@@ -1011,6 +1018,7 @@ fn spec_for(id: &str, cmd: &[&str]) -> JobSpec {
         cancel_reason: None,
         prefer_warm: None,
         warm_key: None,
+        lock: None,
     }
 }
 
@@ -1196,6 +1204,89 @@ async fn warm_cache_is_published_in_facts_and_labels() {
     assert!(!f.warm.contains_key("absent"));
     assert!(f.labels["warm.mono-rust"].starts_with("abc1234@"));
     assert!(!f.labels.contains_key("warm.absent"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobs_sharing_a_lock_run_one_at_a_time_oldest_first() {
+    let dir = tmp();
+    let a = node("solo", free_port().await, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let now = flotilla_core::now_ms();
+    let mk = |age: u64, lock: Option<&str>| {
+        let mut s = spec_for(&uuid::Uuid::new_v4().to_string(), &["sleep", "2"]);
+        s.submitted_at_ms = now - age;
+        s.lock = lock.map(Into::into);
+        s
+    };
+    // Submitted out of order on purpose; ids do not decide who goes first.
+    let second = mk(1000, Some("/builds/mono"));
+    let first = mk(5000, Some("/builds/mono"));
+    let unlocked = mk(0, None);
+    for s in [&second, &first, &unlocked] {
+        a.state.store.put_json(&keys::job(&s.id), s).unwrap();
+    }
+    eventually("first and unlocked claimed", || {
+        [&first, &unlocked]
+            .iter()
+            .all(|s| a.state.store.get(&keys::claim(&s.id)).unwrap().is_some())
+    })
+    .await;
+    assert!(
+        a.state
+            .store
+            .get(&keys::claim(&second.id))
+            .unwrap()
+            .is_none(),
+        "the second job waits for the lock while the first holds it"
+    );
+    let result = |id: &str| -> Option<JobResult> {
+        a.state
+            .store
+            .get(&keys::result(id))
+            .unwrap()
+            .map(|r| r.parse().unwrap())
+    };
+    eventually("all results", || {
+        [&first, &second, &unlocked]
+            .iter()
+            .all(|s| result(&s.id).is_some())
+    })
+    .await;
+    let (f, s) = (result(&first.id).unwrap(), result(&second.id).unwrap());
+    assert!(
+        s.started_at_ms >= f.finished_at_ms,
+        "never overlapped: second started {} before first finished {}",
+        s.started_at_ms,
+        f.finished_at_ms
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_log_can_be_read_from_an_offset() {
+    let dir = tmp();
+    let a = node("solo", free_port().await, vec![], &dir).await;
+    eventually("own facts", || a.state.my_facts().is_some()).await;
+    let spec = spec_for(&uuid::Uuid::new_v4().to_string(), &["echo", "abcdefgh"]);
+    a.state.store.put_json(&keys::job(&spec.id), &spec).unwrap();
+    eventually("result", || {
+        a.state
+            .store
+            .get(&keys::result(&spec.id))
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    let get = |q: &str| {
+        let url = format!("{}/v1/jobs/{}/log{q}", a.base, spec.id);
+        let http = a.http.clone();
+        async move { http.get(url).send().await.unwrap().text().await.unwrap() }
+    };
+    assert_eq!(get("").await, "abcdefgh\n");
+    assert_eq!(get("?from=3").await, "defgh\n");
+    assert_eq!(get("?from=9").await, "");
+    assert_eq!(get("?from=999").await, "");
     std::fs::remove_dir_all(dir).ok();
 }
 

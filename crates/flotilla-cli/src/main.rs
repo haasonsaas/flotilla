@@ -1,6 +1,7 @@
 //! `flotilla`: CLI for the fleet. Talks to the local daemon on loopback for
 //! replicated state, and directly to peers for exec and job logs.
 
+mod build;
 mod client;
 mod commands;
 mod install;
@@ -91,6 +92,8 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Build or test a repo in its fixed checkout on the node with the warm cache
+    Build(build::BuildArgs),
     /// Remove the user service
     Uninstall,
 }
@@ -123,6 +126,7 @@ async fn main() -> Result<()> {
         Cmd::Batch(cmd) => commands::batch(&client, cmd, cli.json).await,
         Cmd::Web { node, print } => commands::web(&client, node.as_deref(), print).await,
         Cmd::Alerts { all } => commands::alerts(&client, all, cli.json).await,
+        Cmd::Build(args) => build::build(&client, args, cli.json).await,
         Cmd::Uninstall => install::uninstall().await,
     }
 }

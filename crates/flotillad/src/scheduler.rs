@@ -103,14 +103,25 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     };
     let now = flotilla_core::now_ms();
     let grace = state.cfg.lease_grace().as_millis() as u64;
+    let mut specs = Vec::new();
     for rec in state.store.list(keys::JOB)? {
-        let spec: JobSpec = match rec.parse() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(key = %rec.key, error = %e, "unparseable job");
-                continue;
-            }
-        };
+        match rec.parse::<JobSpec>() {
+            Ok(s) => specs.push(s),
+            Err(e) => tracing::warn!(key = %rec.key, error = %e, "unparseable job"),
+        }
+    }
+    // Oldest first, so jobs queued behind a lock run in submission order.
+    specs.sort_by(|a, b| (a.submitted_at_ms, &a.id).cmp(&(b.submitted_at_ms, &b.id)));
+    // Locks held by jobs already running on this node.
+    let mut held: std::collections::HashSet<String> = {
+        let ids: Vec<String> = state.running.lock().unwrap().keys().cloned().collect();
+        specs
+            .iter()
+            .filter(|s| ids.contains(&s.id))
+            .filter_map(|s| s.lock.clone())
+            .collect()
+    };
+    for spec in specs {
         if spec.cancelled {
             continue;
         }
@@ -145,6 +156,18 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         if !eligible {
             continue;
         }
+        if let Some(l) = spec.lock.as_ref().filter(|l| held.contains(*l)) {
+            // Queued behind another job on the same lock. Keep our own claim
+            // alive so another node does not take the job over meanwhile.
+            if let Some(claim) =
+                current_claim(state, &spec.id).filter(|c| c.node == state.me.node_id)
+            {
+                tracing::debug!(job = %spec.id, lock = %l, "waiting for lock");
+                renew_claim(state, &claim, None)?;
+            }
+            continue;
+        }
+        let (id, lock) = (spec.id.clone(), spec.lock.clone());
         let has_capacity = state.running.lock().unwrap().len() < state.cfg.max_concurrent_jobs;
         // Placement hint: with `least-load`, only the least loaded eligible
         // node (by the facts everyone replicates) claims. Ties break on node
@@ -201,6 +224,11 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
                 write_claim(state, &spec.id, 1, None)?;
                 tracing::info!(job = %spec.id, "claimed, settling");
                 start(state.clone(), spec, true);
+            }
+        }
+        if let Some(l) = lock {
+            if state.running.lock().unwrap().contains_key(&id) {
+                held.insert(l);
             }
         }
     }
