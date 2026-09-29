@@ -180,6 +180,49 @@ async fn status_once(c: &Client, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `alert/<node>/<id>` records, firing ones first.
+pub async fn alerts(c: &Client, all: bool, json: bool) -> Result<()> {
+    let mut list: Vec<flotilla_core::schema::Alert> = c
+        .list(flotilla_core::keys::ALERT, false)
+        .await?
+        .iter()
+        .filter_map(|r| r.parse().ok())
+        .filter(|a: &flotilla_core::schema::Alert| all || a.firing)
+        .collect();
+    list.sort_by(|a, b| {
+        b.firing
+            .cmp(&a.firing)
+            .then(a.node.cmp(&b.node))
+            .then(a.kind.cmp(&b.kind))
+    });
+    if json {
+        return print_json(&list);
+    }
+    if list.is_empty() {
+        println!("no alerts firing");
+        return Ok(());
+    }
+    let mut t = Table::new();
+    t.load_preset(UTF8_FULL_CONDENSED);
+    t.set_header(["node", "kind", "state", "since", "message"]);
+    for a in &list {
+        let state = if a.firing {
+            Cell::new("firing").fg(Color::Red)
+        } else {
+            Cell::new("cleared").fg(Color::Green)
+        };
+        t.add_row(vec![
+            Cell::new(&a.node),
+            Cell::new(&a.kind),
+            state,
+            Cell::new(ms_ago(a.since_ms) + " ago"),
+            Cell::new(&a.message),
+        ]);
+    }
+    println!("{t}");
+    Ok(())
+}
+
 pub async fn whoami(c: &Client, json: bool) -> Result<()> {
     let me = c.me().await?;
     if json {

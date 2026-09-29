@@ -1,5 +1,6 @@
 //! flotillad: the per-node fleet daemon.
 
+mod alerts;
 mod auth;
 mod config;
 mod exec;
@@ -15,6 +16,7 @@ mod server;
 mod sync_loop;
 #[cfg(test)]
 mod tests;
+mod warm;
 
 use anyhow::{Context, Result};
 use clap::Parser;

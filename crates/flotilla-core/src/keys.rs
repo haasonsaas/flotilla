@@ -6,6 +6,7 @@ pub const CLAIM: &str = "claim/";
 pub const RESULT: &str = "result/";
 pub const DESIRED: &str = "desired/";
 pub const RECONCILE: &str = "reconcile/";
+pub const ALERT: &str = "alert/";
 
 pub fn node_facts(node: &str) -> String {
     format!("{NODE}{node}/facts")
@@ -29,4 +30,12 @@ pub fn reconcile(node: &str) -> String {
 /// Extract the id from a prefixed key, e.g. `job/abc` -> `abc`.
 pub fn id_of<'a>(prefix: &str, key: &'a str) -> Option<&'a str> {
     key.strip_prefix(prefix)
+}
+
+/// `alert/<node id>/<alert id>`
+pub fn alert(node: &str, id: &str) -> String {
+    format!("{ALERT}{node}/{id}")
+}
+pub fn alerts_of(node: &str) -> String {
+    format!("{ALERT}{node}/")
 }

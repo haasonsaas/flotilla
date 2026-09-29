@@ -36,6 +36,7 @@ And the layers built on them:
 | notify | `[notify] ntfy_url, topic` in config | push on failed / lost (or any outcome) from the node that ran the job |
 | artifacts | `flotilla job pull 3fa1 ./out` | files a job wrote to `$FLOTILLA_ARTIFACTS`, fetched from the executor through the local daemon |
 | wake-then-run | `flotilla job submit --wake -n mac-mini -- ...` | if no eligible node is online, wake the matching ones and wait |
+| watchdog | `flotilla alerts` | nodes publish disk, load, build-process and tailscale login facts; `[alerts]` thresholds write `alert/` records and POST to ntfy or a webhook |
 | snapshots | `flotilla records dump fleet.json` / `restore fleet.json` | every raw record out to a file and merged back in |
 
 ## Install
@@ -123,6 +124,37 @@ to that tailnet's peers, including configured `seeds` in the Tailscale
 address ranges, go through `proxy`. The daemon reads the tailnet list once at
 startup: a secondary tailnet that is down is skipped after 30s, so restart
 the daemon after logging one in.
+
+## Watchdog
+
+Every facts record carries health data: free space on `/` and on every other
+mount of 50 GB or more (`disks`), load per core, the number of running
+`cargo` and `rustc` processes (`build_procs`), and the login state of each
+configured tailnet's tailscaled (`tailscale`: `Running`, `NeedsLogin`,
+`Stopped`, or `unreachable` when the daemon does not answer).
+
+`[alerts]` sets the thresholds. These are the defaults; `ntfy_url`, `topic`
+and `token` fall back to `[notify]` when unset:
+
+```toml
+[alerts]
+disk_free_pct_min    = 10      # any watched volume below 10% free; 0 disables
+tailscale_logged_out = true    # any tailnet not Running
+load_per_core_max    = 0       # off; e.g. 2.0 alerts above 2 load per core
+for_secs             = 60      # condition must hold this long before it fires
+ntfy_url             = "https://ntfy.sh"
+topic                = "fleet-alerts"
+webhook_url          = "https://example.com/hook"   # JSON: {"event","alert"}
+notify_resolved      = false
+renotify_hours       = 0       # 0 sends once per incident
+```
+
+A tripped threshold writes `alert/<node id>/<id>` with `firing = true` and
+sends one notification. When the condition clears the record is rewritten
+with `firing = false` (and a notice goes out if `notify_resolved`). The
+record is written before the POST, so a node whose network is the problem
+still records it and replicates the alert when it reconnects. `flotilla
+alerts` lists firing alerts across the fleet, `--all` includes cleared ones.
 
 ## Auth
 
@@ -220,6 +252,22 @@ On macOS, jobs run under `caffeinate -i` so a laptop on power does not doze
 mid-build (`caffeinate_jobs = false` to disable), and facts carry `xcode=<ver>`
 and `tmux=yes` labels when those tools are present, so `-l xcode=16.2` works
 as a selector.
+
+Nodes can advertise build caches they hold warm. In the node's config:
+
+```toml
+[[warm_cache]]
+name = "mono-rust"
+path = "/builds/mono/target"
+key_cmd = "git -C /builds/mono rev-parse --short HEAD"   # optional
+```
+
+Every facts refresh (`facts_interval_secs`) publishes a label
+`warm.mono-rust=<key>@<age>` (for example `3fa9c1e@12m`; age is time since the
+newest change under the directory) and a structured `warm` field in the node's
+facts with the path, size (recomputed every 5 minutes in the background) and
+last-used time. A cache whose directory does not exist is not advertised.
+`key_cmd` runs under `sh -c` with a 5s limit; its first output line is the key.
 
 A desired-state file:
 

@@ -4,7 +4,7 @@
 use crate::config::{Config, StaticIdentityConfig, TailnetConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use flotilla_core::api::PeerInfo;
-use flotilla_core::schema::TailnetInfo;
+use flotilla_core::schema::{TailnetHealth, TailnetInfo};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -207,6 +207,23 @@ impl IdentityProvider {
         Ok(primary)
     }
 
+    /// Login state of each tailnet's tailscaled, asked fresh (the status
+    /// cache would keep reporting `Running` for a daemon that just died).
+    pub async fn health(&self) -> Vec<TailnetHealth> {
+        let mut out = Vec::new();
+        for h in &self.tailnets {
+            let state = match &h.backend {
+                Backend::Static(_) => "Running".to_string(),
+                Backend::Tailscale(t) => t.backend_state().await,
+            };
+            out.push(TailnetHealth {
+                name: h.name.clone(),
+                state,
+            });
+        }
+        out
+    }
+
     /// Peers from every tailnet, each tagged with the tailnet that reported
     /// it. One tailnet failing does not hide the others.
     pub async fn peers(&self) -> Result<Vec<PeerInfo>> {
@@ -361,6 +378,21 @@ async fn run_cli(bin: &Path, socket: Option<&Path>, args: &[&str]) -> Result<Val
 }
 
 impl Tailscale {
+    /// `BackendState` from a fresh `status --json`, or `unreachable`.
+    pub async fn backend_state(&self) -> String {
+        match self.run(&["status", "--json"]).await {
+            Ok(v) => parse_backend_state(&v),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("NeedsLogin") || msg.contains("Logged out") {
+                    "NeedsLogin".into()
+                } else {
+                    "unreachable".into()
+                }
+            }
+        }
+    }
+
     /// The peer list, never blocking on the tailscale CLI once we have one:
     /// a stale cache is returned immediately and refreshed in the
     /// background. Only the very first call (no cache yet) waits.
@@ -523,6 +555,14 @@ impl Tailscale {
 }
 
 /// 100.64.0.0/10 or fd7a:115c:a1e0::/48, the ranges Tailscale hands out.
+/// `BackendState` of a `tailscale status --json` document.
+fn parse_backend_state(v: &Value) -> String {
+    v.get("BackendState")
+        .and_then(Value::as_str)
+        .unwrap_or("unreachable")
+        .to_string()
+}
+
 fn in_tailscale_range(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -881,5 +921,37 @@ mod tests {
         assert_eq!(peers[0].name, "peer");
         assert!(peers[0].online);
         assert_eq!(peers[0].tags, vec!["tag:a"]);
+    }
+
+    #[test]
+    fn backend_state_from_status_json() {
+        let v = serde_json::json!({"BackendState": "NeedsLogin", "Self": {}});
+        assert_eq!(parse_backend_state(&v), "NeedsLogin");
+        assert_eq!(parse_backend_state(&serde_json::json!({})), "unreachable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_reads_fresh_state_from_the_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("flotilla-ts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("tailscale");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho '{\"BackendState\":\"NeedsLogin\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let logged_out = Tailscale::new(Some(fake), None).unwrap();
+        assert_eq!(logged_out.backend_state().await, "NeedsLogin");
+        // a dead daemon makes the CLI exit non-zero
+        let dead = Tailscale::new(Some(PathBuf::from("/bin/false")), None).unwrap();
+        assert_eq!(dead.backend_state().await, "unreachable");
+        // a static tailnet always reports Running
+        let p = two_tailnets();
+        let h = p.health().await;
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().all(|t| t.state == "Running"));
     }
 }
