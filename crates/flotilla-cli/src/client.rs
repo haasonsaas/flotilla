@@ -284,6 +284,21 @@ impl Client {
         Ok(Some(Self::check(resp).await?.text().await?))
     }
 
+    /// The job log from byte `from` on, or None while no log exists yet.
+    pub async fn job_log_from(&self, id: &str, from: u64) -> Result<Option<Vec<u8>>> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/jobs/{id}/log", self.base))
+            .query(&[("from", from)])
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(Self::check(resp).await?.bytes().await?.to_vec()))
+    }
+
     /// Upload a local file to a path on the node.
     pub async fn put_file(
         &self,

@@ -108,6 +108,7 @@ mod tests {
             cancel_reason: None,
             prefer_warm: Some("mono-rust".into()),
             warm_key: key.map(Into::into),
+            lock: None,
         }
     }
 

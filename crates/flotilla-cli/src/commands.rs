@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::Duration;
 
-fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
+pub(crate) fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
@@ -372,7 +372,7 @@ pub struct RunArgs {
     cmd: Vec<String>,
 }
 
-fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>> {
+pub(crate) fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>> {
     pairs
         .iter()
         .map(|p| {
@@ -554,6 +554,10 @@ pub struct SubmitArgs {
     /// With --prefer-warm: the cache key wanted (e.g. a commit hash)
     #[arg(long = "warm-key", requires = "prefer_warm")]
     warm_key: Option<String>,
+    /// Never run at the same time as another job with this lock on one node
+    /// (they queue, oldest first), e.g. a checkout path they share
+    #[arg(long)]
+    lock: Option<String>,
     /// Run inside a detached tmux session of this name on the executor
     #[arg(long)]
     tmux: Option<String>,
@@ -693,6 +697,7 @@ pub async fn job(c: &Client, cmd: JobCmd, json: bool) -> Result<()> {
                 cancel_reason: None,
                 prefer_warm: a.prefer_warm,
                 warm_key: a.warm_key,
+                lock: a.lock,
             };
             c.put_json(&keys::job(&spec.id), &spec).await?;
             if json && !a.wait {
@@ -2042,6 +2047,7 @@ pub async fn agent(c: &Client, cmd: AgentCmd, json: bool) -> Result<()> {
                 cancel_reason: None,
                 prefer_warm: None,
                 warm_key: None,
+                lock: None,
             };
             c.put_json(&keys::job(&id), &spec).await?;
             if json && !a.wait {
@@ -2303,6 +2309,7 @@ pub async fn batch(c: &Client, cmd: BatchCmd, _json: bool) -> Result<()> {
                     cancel_reason: None,
                     prefer_warm: None,
                     warm_key: None,
+                    lock: None,
                 };
                 c.put_json(&keys::job(&spec.id), &spec).await?;
                 ids.push(spec.id);
@@ -2333,6 +2340,7 @@ pub async fn batch(c: &Client, cmd: BatchCmd, _json: bool) -> Result<()> {
                     cancel_reason: None,
                     prefer_warm: None,
                     warm_key: None,
+                    lock: None,
                 };
                 c.put_json(&keys::job(&spec.id), &spec).await?;
             }

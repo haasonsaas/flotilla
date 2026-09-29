@@ -645,6 +645,9 @@ struct LogQuery {
     /// Return only the last N bytes.
     #[serde(default)]
     tail: Option<u64>,
+    /// Skip the first N bytes, so a follower can fetch only what is new.
+    #[serde(default)]
+    from: Option<u64>,
     /// Internal: set when proxying so two nodes never bounce a request.
     #[serde(default)]
     noproxy: bool,
@@ -664,6 +667,9 @@ async fn get_job_log(
     let path = state.cfg.job_log_path(&id);
     match tokio::fs::read(&path).await {
         Ok(mut bytes) => {
+            if let Some(from) = q.from {
+                bytes.drain(..(from as usize).min(bytes.len()));
+            }
             if let Some(n) = q.tail {
                 if (bytes.len() as u64) > n {
                     let cut = bytes.len() - n as usize;
@@ -705,6 +711,9 @@ async fn get_job_log(
                 .query(&[("noproxy", "true")]);
             if let Some(n) = q.tail {
                 req = req.query(&[("tail", n)]);
+            }
+            if let Some(n) = q.from {
+                req = req.query(&[("from", n)]);
             }
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {

@@ -237,6 +237,10 @@ pub struct JobSpec {
     /// over a merely fresher cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_key: Option<String>,
+    /// Jobs with the same lock never run at the same time on one node; they
+    /// queue there oldest first (e.g. a fixed checkout path they share).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<String>,
 }
 
 /// `claim/<id>`: written by a node that intends to run the job.
@@ -421,6 +425,7 @@ mod tests {
             cancel_reason: None,
             prefer_warm: None,
             warm_key: None,
+            lock: None,
         }
     }
 

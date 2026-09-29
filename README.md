@@ -241,6 +241,7 @@ flotilla agent run --cwd ~/code/mono -- grok -p "resolve the conflict in PR 9138
 flotilla agent ls                              # every agent run, node, elapsed, last output line
 flotilla agent attach 3fa1                     # ssh -t into its tmux session on the executor
 flotilla job submit --pick least-load -- cargo test   # any job can ask for the idlest node
+flotilla build --repo dx-corp/mono --ref my-branch -- cargo test -p foo   # fixed checkout on the warm node
 flotilla web                                   # open the dashboard; `flotilla web dev-desktop-1` opens that node's
 ```
 
@@ -360,6 +361,59 @@ A daemon that is stopped (SIGTERM, `launchctl kickstart -k`, `systemctl
 restart`) kills its running jobs' process groups and leaves their claims in
 place, so it resumes them itself on restart or another node takes them over
 once the lease lapses. No result is written for a job interrupted this way.
+
+## Fast builds across the fleet
+
+`flotilla build` runs a command in a fixed checkout of a repo on the node that
+already has the warm build cache:
+
+```sh
+flotilla build --repo dx-corp/mono --ref my-branch -- cargo test -p some-crate some_filter
+```
+
+It submits a durable job that prefers the `<repo name>-rust` warm cache
+(`--prefer-warm` to change it; see `[[warm_cache]]` above), so the job lands on
+the node whose `target/` is freshest, not the one that happens to be idle. On
+that node the job runs `git fetch origin <ref>`, a detached checkout of
+`FETCH_HEAD`, and then your command from the checkout root. Output streams to
+your terminal as it is written, the exit code is the command's, and ctrl-c
+cancels the job. `--detach` prints the job id instead of following it, and
+`--remote` overrides the clone URL (default `https://github.com/<repo>.git`;
+the node needs git credentials for private repos).
+
+The checkout path is deliberately fixed (`/builds/<repo name>`, or `--path`)
+and identical on every node. sccache keys include the absolute source path, so
+a shared sccache backend only produces hits across machines when the path is
+the same everywhere. Two branches cannot share one checkout, so builds for the
+same path carry a `lock` (also `job submit --lock`): a node runs jobs with the
+same lock one at a time, oldest first, and the rest wait queued behind it.
+
+Node setup for the mono example:
+
+```toml
+# ~/.config/flotilla/config.toml
+[[warm_cache]]
+name = "mono-rust"
+path = "/builds/mono/target"
+key_cmd = "git -C /builds/mono rev-parse --short HEAD"
+```
+
+To share compiled dependencies between nodes, point sccache at one store in
+each node's environment (flotilla does not provision it). For S3-compatible
+storage:
+
+```sh
+export RUSTC_WRAPPER=sccache
+export SCCACHE_BUCKET=build-cache
+export SCCACHE_ENDPOINT=https://s3.example.com   # omit for AWS S3
+export SCCACHE_REGION=auto
+export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
+```
+
+or a Redis server: `export SCCACHE_REDIS=redis://cache.internal:6379/0`. Put
+these in the daemon's environment (or pass them per build with
+`flotilla build -e SCCACHE_BUCKET=... -e RUSTC_WRAPPER=sccache`) so jobs
+inherit them. `sccache --show-stats` on a node shows the hit rate.
 
 ## Store hygiene
 
