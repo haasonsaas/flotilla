@@ -40,6 +40,19 @@ pub struct NodeFacts {
     /// Wired/wireless interfaces with a private IPv4, for wake-on-LAN.
     #[serde(default)]
     pub lan: Vec<LanInterface>,
+    /// Every tailnet this node is on, with its node id and addresses there.
+    /// Empty on nodes older than multi-tailnet support.
+    #[serde(default)]
+    pub tailnets: Vec<TailnetInfo>,
+}
+
+/// One node's presence on one tailnet. `node_id` is the id the tailnet's
+/// peer list uses for it, which differs per tailnet for the same machine.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TailnetInfo {
+    pub name: String,
+    pub node_id: String,
+    pub ips: Vec<String>,
 }
 
 /// A LAN interface as reported by a node.

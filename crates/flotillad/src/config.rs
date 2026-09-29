@@ -49,9 +49,73 @@ pub struct Config {
     /// non-default port, as `host:port`. Once a peer's facts are known its
     /// advertised port is used instead.
     pub seeds: Vec<String>,
+    /// Override the node name (default: the first tailnet's node name).
+    pub name: Option<String>,
+    /// Tailnets this node is on, each with its own tailscaled. The first is
+    /// the primary: its node id is this node's fleet identity. Empty means
+    /// one implicit tailnet reached through `tailscale_bin` / the default
+    /// socket.
+    pub tailnet: Vec<TailnetConfig>,
     /// "tailscale" (default) or "static" (tests).
     pub identity: String,
     pub static_identity: Option<StaticIdentityConfig>,
+}
+
+/// `[[tailnet]]`: one tailnet this node is on.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TailnetConfig {
+    /// Label shown in `flotilla status` / `peers`, e.g. `evalops`.
+    pub name: String,
+    /// tailscaled socket for this tailnet (`tailscale --socket=...`).
+    /// Unset uses the CLI's default socket.
+    pub socket: Option<PathBuf>,
+    /// tailscale CLI for this tailnet. Falls back to `tailscale_bin`, then
+    /// auto-detection.
+    pub bin: Option<PathBuf>,
+    /// For a tailscaled in userspace-networking mode, whose Tailscale
+    /// addresses are not local interfaces: a proxy URL through which
+    /// outbound requests to this tailnet's peers are sent, e.g.
+    /// `socks5://127.0.0.1:1056` (its `--socks5-server`) or
+    /// `http://127.0.0.1:1057` (its `--outbound-http-proxy-listen`).
+    pub proxy: Option<String>,
+    /// Shorthand for `proxy = "socks5://<host:port>"`.
+    pub socks5: Option<String>,
+    /// For userspace-networking: a loopback `host:port` on which this daemon
+    /// accepts PROXY-protocol connections, fed by
+    /// `tailscale serve --tcp=<port> --proxy-protocol=2 tcp://<host:port>`.
+    /// The real caller address comes from the PROXY header and is resolved
+    /// with `whois` against this tailnet.
+    pub proxy_listen: Option<String>,
+    /// Replace the global `allowed_users` for callers arriving on this tailnet.
+    pub allowed_users: Option<Vec<String>>,
+    /// Replace the global `allowed_tags` for callers arriving on this tailnet.
+    pub allowed_tags: Option<Vec<String>>,
+    /// Tests only, with `identity = "static"`.
+    pub static_identity: Option<StaticIdentityConfig>,
+}
+
+impl TailnetConfig {
+    /// The outbound proxy URL for this tailnet, if any.
+    pub fn proxy_url(&self) -> Option<String> {
+        self.proxy
+            .clone()
+            .or_else(|| self.socks5.as_ref().map(|h| format!("socks5://{h}")))
+    }
+}
+
+impl Config {
+    /// The allow-lists that apply to callers arriving on tailnet `idx`:
+    /// the tailnet's own if it sets either, else the global ones.
+    pub fn allow_lists(&self, idx: usize) -> (&[String], &[String]) {
+        match self.tailnet.get(idx) {
+            Some(t) if t.allowed_users.is_some() || t.allowed_tags.is_some() => (
+                t.allowed_users.as_deref().unwrap_or(&[]),
+                t.allowed_tags.as_deref().unwrap_or(&[]),
+            ),
+            _ => (&self.allowed_users, &self.allowed_tags),
+        }
+    }
 }
 
 /// `[notify]`: POST a line to an ntfy topic when a job this node ran
@@ -122,6 +186,8 @@ impl Default for Config {
             notify: None,
             listen: Vec::new(),
             seeds: Vec::new(),
+            name: None,
+            tailnet: Vec::new(),
             identity: "tailscale".into(),
             static_identity: None,
         }
@@ -192,5 +258,49 @@ impl Config {
     /// through sync is not mistaken for a dead executor.
     pub fn lease_grace(&self) -> std::time::Duration {
         self.settle_window()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tailnet_tables() {
+        let cfg: Config = toml::from_str(
+            r#"
+            name = "mac-mini"
+            allowed_users = ["me@example.com"]
+            [[tailnet]]
+            name = "evalops"
+            socket = "/var/run/tailscaled-evalops.sock"
+            proxy = "http://127.0.0.1:1057"
+            proxy_listen = "127.0.0.1:7411"
+            [[tailnet]]
+            name = "homelab"
+            allowed_users = ["home@example.com"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tailnet.len(), 2);
+        assert_eq!(
+            cfg.tailnet[0].proxy_url().as_deref(),
+            Some("http://127.0.0.1:1057")
+        );
+        assert_eq!(cfg.allow_lists(0).0, ["me@example.com"]);
+        assert_eq!(cfg.allow_lists(1).0, ["home@example.com"]);
+        assert!(
+            cfg.allow_lists(1).1.is_empty(),
+            "a tailnet's own list replaces both global lists"
+        );
+        let s5 = TailnetConfig {
+            socks5: Some("127.0.0.1:1056".into()),
+            ..Default::default()
+        };
+        assert_eq!(s5.proxy_url().as_deref(), Some("socks5://127.0.0.1:1056"));
+        // no [[tailnet]]: today's single-tailnet config is unchanged
+        let old: Config = toml::from_str("allowed_tags = [\"tag:x\"]").unwrap();
+        assert!(old.tailnet.is_empty());
+        assert_eq!(old.allow_lists(0).1, ["tag:x"]);
     }
 }

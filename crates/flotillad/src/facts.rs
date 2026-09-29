@@ -87,6 +87,7 @@ pub fn collect(state: &AppState) -> NodeFacts {
         running_jobs: state.running_jobs(),
         sessions: tmux_sessions(),
         lan: lan_interfaces(),
+        tailnets: state.me.tailnets.clone(),
         exe_path: std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),

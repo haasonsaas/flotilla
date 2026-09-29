@@ -93,9 +93,11 @@ async fn status_once(c: &Client, json: bool) -> Result<()> {
         .await
         .map(|r| r.peers.into_iter().map(|p| (p.key.clone(), p)).collect())
         .unwrap_or_default();
+    // Only show the tailnet column when some node is on more than one.
+    let multi = st.nodes.iter().any(|n| n.facts.tailnets.len() > 1);
     let mut t = Table::new();
     t.load_preset(UTF8_FULL_CONDENSED);
-    t.set_header([
+    let mut header = vec![
         "node",
         "state",
         "os",
@@ -109,7 +111,11 @@ async fn status_once(c: &Client, json: bool) -> Result<()> {
         "labels",
         "facts age",
         "synced",
-    ]);
+    ];
+    if multi {
+        header.insert(2, "tailnets");
+    }
+    t.set_header(header);
     for n in &st.nodes {
         let f = &n.facts;
         let state = if n.online {
@@ -149,7 +155,7 @@ async fn status_once(c: &Client, json: bool) -> Result<()> {
                 None => Cell::new("never").fg(Color::DarkGrey),
             }
         };
-        t.add_row(vec![
+        let mut row = vec![
             Cell::new(name),
             state,
             Cell::new(&f.os),
@@ -163,7 +169,12 @@ async fn status_once(c: &Client, json: bool) -> Result<()> {
             Cell::new(labels.join(",")),
             Cell::new(age(n.facts_age_secs)),
             synced,
-        ]);
+        ];
+        if multi {
+            let names: Vec<&str> = f.tailnets.iter().map(|t| t.name.as_str()).collect();
+            row.insert(2, Cell::new(names.join(",")));
+        }
+        t.add_row(row);
     }
     println!("{t}");
     Ok(())
@@ -192,15 +203,24 @@ pub async fn peers(c: &Client, json: bool) -> Result<()> {
     }
     let mut t = Table::new();
     t.load_preset(UTF8_FULL_CONDENSED);
-    t.set_header(["peer", "online", "os", "ips", "tags"]);
+    let multi = p.me.tailnets.len() > 1;
+    let mut header = vec!["peer", "online", "os", "ips", "tags"];
+    if multi {
+        header.insert(1, "tailnet");
+    }
+    t.set_header(header);
     for peer in p.peers.iter().filter(|p| p.online) {
-        t.add_row([
+        let mut row = vec![
             peer.name.clone(),
             "yes".into(),
             peer.os.clone(),
             peer.ips.join(","),
             peer.tags.join(","),
-        ]);
+        ];
+        if multi {
+            row.insert(1, peer.tailnet.clone());
+        }
+        t.add_row(row);
     }
     let offline = p.peers.iter().filter(|p| !p.online).count();
     println!("{t}");
@@ -320,11 +340,23 @@ fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>> {
         .collect()
 }
 
+/// A node's addresses on tailnets we share with it, else all of them.
+fn node_ips(st: &StatusResponse, n: &NodeStatus) -> Vec<String> {
+    let mine = st
+        .nodes
+        .iter()
+        .find(|m| m.facts.node_id == st.me)
+        .map(|m| m.facts.tailnets.as_slice())
+        .unwrap_or_default();
+    flotilla_core::api::dial_ips(mine, &n.facts.tailnets, &n.facts.tailscale_ips)
+}
+
 fn node_url(c: &Client, st: &StatusResponse, n: &NodeStatus) -> Result<Client> {
     if n.facts.node_id == st.me {
         return Ok(c.clone());
     }
-    let url = peer_url(&n.facts.tailscale_ips, n.facts.port)
+    let ips = node_ips(st, n);
+    let url = peer_url(&ips, n.facts.port)
         .ok_or_else(|| anyhow!("{} has no reachable address", n.facts.name))?;
     Ok(c.at(&url))
 }
@@ -1704,13 +1736,12 @@ pub async fn session(c: &Client, cmd: SessionCmd, json: bool) -> Result<()> {
             Ok(())
         }
         SessionCmd::Attach { node, name, user } => {
-            let (_, n) = find_node(c, &node).await?;
-            let ip = n
-                .facts
-                .tailscale_ips
+            let (st, n) = find_node(c, &node).await?;
+            let ips = node_ips(&st, &n);
+            let ip = ips
                 .iter()
                 .find(|s| !s.contains(':'))
-                .or(n.facts.tailscale_ips.first())
+                .or(ips.first())
                 .ok_or_else(|| anyhow!("node has no address"))?;
             let target = match user {
                 Some(u) => format!("{u}@{ip}"),

@@ -63,6 +63,67 @@ as an input and put `flotilla.packages.${system}.default` in your profile.
 Do that on every node. The daemon binds loopback and each Tailscale IP on port
 7400. Nothing else needs to be opened; WireGuard is the wire encryption.
 
+## Several tailnets, userspace tailscaled
+
+A node can be on more than one tailnet, each served by its own tailscaled.
+List them as `[[tailnet]]` tables; the first is the primary and its node id is
+the node's fleet identity. With no `[[tailnet]]` table nothing changes.
+
+```toml
+name = "mac-mini"            # optional; default is the primary's node name
+
+[[tailnet]]
+name   = "evalops"
+socket = "/var/run/tailscaled-evalops.sock"   # tailscale --socket=...
+bin    = "/opt/homebrew/bin/tailscale"        # optional, per tailnet
+
+[[tailnet]]
+name          = "homelab"
+allowed_users = ["me@example.com"]  # replaces the global lists for this tailnet
+```
+
+- Peers from every tailnet are merged. The same machine has a different node
+  id on each tailnet; its facts list them all (`tailnets`), so it appears once.
+- The daemon binds `:7400` on each tailnet's addresses. A connection is
+  identified with `whois` on the tailnet it arrived on, so overlapping
+  100.x addresses on two tailnets cannot be confused. `allowed_users` /
+  `allowed_tags` under a `[[tailnet]]` replace the global lists for callers on
+  that tailnet.
+- A node on two tailnets carries the fleet between them by ordinary
+  anti-entropy. Outbound requests use an address on a tailnet both nodes share.
+- `flotilla status` gains a `tailnets` column, and `flotilla peers` a
+  `tailnet` column, when any node is on more than one.
+
+A tailscaled started with `--tun=userspace-networking` has no local
+interfaces for its addresses, so flotillad cannot bind them or dial out
+directly. Two more keys handle that:
+
+```toml
+[[tailnet]]
+name         = "evalops"
+socket       = "/var/run/tailscaled-evalops.sock"
+proxy        = "socks5://127.0.0.1:1056"   # tailscaled --socks5-server, or
+                                           # http://127.0.0.1:1057 (--outbound-http-proxy-listen)
+proxy_listen = "127.0.0.1:7411"            # loopback, expects PROXY protocol
+```
+
+Inbound, forward the tailnet port with the caller's address preserved:
+
+```sh
+tailscale --socket=/var/run/tailscaled-evalops.sock serve --bg \
+  --tcp=7400 --proxy-protocol=2 tcp://127.0.0.1:7411
+```
+
+The PROXY header carries the caller's real tailnet address, which is what
+`whois` needs. A plain TCP forward would make every caller look like
+loopback, which the daemon trusts, so `proxy_listen` refuses connections that
+do not start with a PROXY header. If the tailnet policy admits only one port
+(say 50051), set `port = 50051` and use it in `--tcp=` too. Outbound requests
+to that tailnet's peers, including configured `seeds` in the Tailscale
+address ranges, go through `proxy`. The daemon reads the tailnet list once at
+startup: a secondary tailnet that is down is skipped after 30s, so restart
+the daemon after logging one in.
+
 ## Auth
 
 Inbound requests from the tailnet are resolved with `tailscale whois`. A caller

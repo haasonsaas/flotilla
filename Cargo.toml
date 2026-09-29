@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/flotilla-core", "crates/flotillad", "crates/flotilla-cli"]
 
 [workspace.package]
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/haasonsaas/flotilla"
@@ -23,7 +23,7 @@ redb = "4"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 axum = { version = "0.8", features = ["json"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "socks"] }
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.9"
 sysinfo = "0.37"
