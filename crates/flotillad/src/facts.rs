@@ -2,17 +2,20 @@
 
 use crate::server::{pause, AppState};
 use flotilla_core::keys;
-use flotilla_core::schema::NodeFacts;
+use flotilla_core::schema::{DiskInfo, NodeFacts, TailnetHealth};
 use flotilla_core::selector::Labels;
 use std::time::Duration;
-use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{
+    Disks, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+};
 
 pub async fn run(state: AppState) {
     let interval = Duration::from_secs(state.cfg.facts_interval_secs);
     loop {
+        let tailscale = state.identity.health().await;
         match tokio::task::spawn_blocking({
             let state = state.clone();
-            move || collect(&state)
+            move || collect(&state, tailscale)
         })
         .await
         {
@@ -23,6 +26,7 @@ pub async fn run(state: AppState) {
                 {
                     tracing::error!(error = %e, "writing facts");
                 }
+                crate::alerts::check(&state, &facts).await;
             }
             Err(e) => tracing::error!(error = %e, "facts collector panicked"),
         }
@@ -30,7 +34,7 @@ pub async fn run(state: AppState) {
     }
 }
 
-pub fn collect(state: &AppState) -> NodeFacts {
+pub fn collect(state: &AppState, tailscale: Vec<TailnetHealth>) -> NodeFacts {
     let sys = System::new_with_specifics(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
     );
@@ -39,6 +43,10 @@ pub fn collect(state: &AppState) -> NodeFacts {
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"));
     let (bat, ac) = battery();
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let load_1m = System::load_average().one;
     let mut labels = Labels::new();
     labels.insert("os".into(), std::env::consts::OS.into());
     labels.insert("arch".into(), std::env::consts::ARCH.into());
@@ -67,10 +75,23 @@ pub fn collect(state: &AppState) -> NodeFacts {
         },
         arch: std::env::consts::ARCH.into(),
         version: crate::VERSION.into(),
-        cpus: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(0),
-        load_1m: System::load_average().one,
+        cpus,
+        load_1m,
+        load_per_core: load_1m / cpus.max(1) as f64,
+        disks: select_disks(
+            disks
+                .iter()
+                .map(|d| {
+                    (
+                        d.mount_point().to_string_lossy().into_owned(),
+                        d.total_space(),
+                        d.available_space(),
+                    )
+                })
+                .collect(),
+        ),
+        build_procs: count_build_procs(),
+        tailscale,
         mem_total_mb: sys.total_memory() / (1024 * 1024),
         // sysinfo reports available_memory() as 0 on macOS; fall back to total - used.
         mem_free_mb: match sys.available_memory() {
@@ -98,6 +119,44 @@ pub fn collect(state: &AppState) -> NodeFacts {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
     }
+}
+
+/// Volumes worth watching: the root filesystem and every mount of at least
+/// 50 GB. macOS shows one APFS container as several mounts with the same
+/// totals; those collapse to the shortest mount path.
+const WATCH_MIN_BYTES: u64 = 50_000_000_000;
+
+pub fn select_disks(mut all: Vec<(String, u64, u64)>) -> Vec<DiskInfo> {
+    all.retain(|(m, total, _)| m == "/" || *total >= WATCH_MIN_BYTES);
+    all.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+    let mut out: Vec<DiskInfo> = Vec::new();
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    for (mount, total, free) in all {
+        let gb = (total / 1_000_000_000, free / 1_000_000_000);
+        if mount != "/" && seen.contains(&gb) {
+            continue;
+        }
+        seen.push(gb);
+        if out.iter().any(|d| d.mount == mount) {
+            continue;
+        }
+        out.push(DiskInfo {
+            mount,
+            total_gb: gb.0,
+            free_gb: gb.1,
+        });
+    }
+    out
+}
+
+/// Running `cargo` and `rustc` processes, a proxy for "a build is on".
+fn count_build_procs() -> u32 {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    sys.processes()
+        .values()
+        .filter(|p| matches!(p.name().to_str(), Some("cargo" | "rustc")))
+        .count() as u32
 }
 
 /// tmux sessions visible to the daemon's user (same default socket the
@@ -180,6 +239,41 @@ fn normalise_mac(raw: &str) -> Option<String> {
     }
     let mac = octets.join(":");
     (mac != "02:00:00:00:00:00" && mac != "00:00:00:00:00:00").then_some(mac)
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn selects_root_and_big_mounts_and_collapses_apfs_twins() {
+        let g = 1_000_000_000u64;
+        let disks = select_disks(vec![
+            ("/".into(), 500 * g, 100 * g),
+            ("/System/Volumes/Data".into(), 500 * g, 100 * g),
+            ("/mnt/build".into(), 590 * g, 0),
+            ("/boot".into(), g, g / 2),
+            ("/mnt/small".into(), 49 * g, 10 * g),
+        ]);
+        let mounts: Vec<&str> = disks.iter().map(|d| d.mount.as_str()).collect();
+        assert_eq!(mounts, ["/", "/mnt/build"]);
+        assert_eq!(disks[1].free_gb, 0);
+        assert_eq!(disks[1].free_pct(), 0.0);
+    }
+
+    #[test]
+    fn small_root_is_still_watched() {
+        let d = select_disks(vec![("/".into(), 20_000_000_000, 1_000_000_000)]);
+        assert_eq!(d.len(), 1);
+        assert!((d[0].free_pct() - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn counts_only_cargo_and_rustc() {
+        // the test binary is neither, but the counter must not panic and
+        // returns a plain count
+        let _ = count_build_procs();
+    }
 }
 
 #[cfg(test)]
