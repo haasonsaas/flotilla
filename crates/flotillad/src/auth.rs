@@ -79,10 +79,53 @@ fn all_roles() -> BTreeSet<Role> {
         .collect()
 }
 
-/// Roles for a resolved caller. Empty means "not allowed at all".
+/// The caller's address as the listener saw it: the TCP peer for plain
+/// listeners, the PROXY header's source for userspace-tailnet listeners.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientAddr(pub SocketAddr);
+
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for ClientAddr
+{
+    fn connect_info(s: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        ClientAddr(*s.remote_addr())
+    }
+}
+
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, crate::proxyproto::ProxyListener>,
+    > for ClientAddr
+{
+    fn connect_info(s: axum::serve::IncomingStream<'_, crate::proxyproto::ProxyListener>) -> Self {
+        ClientAddr(*s.remote_addr())
+    }
+}
+
+/// Which tailnet (index into the identity provider) a connection arrived
+/// on, attached to each listener's routes. Tailnets can hand out the same
+/// address to different machines, so `whois` must ask the right one.
+#[derive(Clone, Copy, Debug)]
+pub struct TailnetCtx(pub usize);
+
+/// Roles for a resolved caller on the primary tailnet. Empty means "not
+/// allowed at all".
+#[cfg(test)]
 pub fn roles_for(cfg: &crate::config::Config, w: &crate::identity::WhoIs) -> BTreeSet<Role> {
-    let user_ok = cfg.allowed_users.iter().any(|u| u == &w.login);
-    let tag_ok = w.tags.iter().any(|t| cfg.allowed_tags.contains(t));
+    roles_for_in(cfg, 0, w)
+}
+
+/// Roles for a caller that arrived on tailnet `idx`, using that tailnet's
+/// allow-lists if it has its own.
+pub fn roles_for_in(
+    cfg: &crate::config::Config,
+    idx: usize,
+    w: &crate::identity::WhoIs,
+) -> BTreeSet<Role> {
+    let (users, tags) = cfg.allow_lists(idx);
+    let user_ok = users.iter().any(|u| u == &w.login);
+    let tag_ok = w.tags.iter().any(|t| tags.contains(t));
     if user_ok || tag_ok {
         return all_roles();
     }
@@ -103,7 +146,7 @@ pub fn roles_for(cfg: &crate::config::Config, w: &crate::identity::WhoIs) -> BTr
 
 pub async fn require_peer(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(ClientAddr(addr)): ConnectInfo<ClientAddr>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -116,9 +159,10 @@ pub async fn require_peer(
             roles: all_roles(),
         }
     } else {
-        match state.identity.whois(ip).await {
+        let tailnet = req.extensions().get::<TailnetCtx>().map_or(0, |c| c.0);
+        match state.identity.whois_in(tailnet, ip).await {
             Ok(Some(w)) => {
-                let roles = roles_for(&state.cfg, &w);
+                let roles = roles_for_in(&state.cfg, tailnet, &w);
                 if roles.is_empty() {
                     tracing::warn!(%ip, login = %w.login, tags = ?w.tags, "rejected: no roles");
                     return reject(
@@ -250,6 +294,38 @@ mod tests {
             ..Config::default()
         };
         assert!(roles_for(&other, &w).is_empty());
+    }
+
+    #[test]
+    fn per_tailnet_allow_lists_replace_global_ones() {
+        use crate::config::TailnetConfig;
+        let cfg = Config {
+            allowed_users: vec!["me@example.com".into()],
+            tailnet: vec![
+                TailnetConfig {
+                    name: "evalops".into(),
+                    ..Default::default()
+                },
+                TailnetConfig {
+                    name: "homelab".into(),
+                    allowed_users: Some(vec!["home@example.com".into()]),
+                    ..Default::default()
+                },
+            ],
+            ..Config::default()
+        };
+        // tailnet 0 has no lists of its own: the global list applies
+        assert_eq!(
+            roles_for_in(&cfg, 0, &who("me@example.com", &[])),
+            all_roles()
+        );
+        assert!(roles_for_in(&cfg, 0, &who("home@example.com", &[])).is_empty());
+        // tailnet 1 has its own list, which replaces the global one
+        assert_eq!(
+            roles_for_in(&cfg, 1, &who("home@example.com", &[])),
+            all_roles()
+        );
+        assert!(roles_for_in(&cfg, 1, &who("me@example.com", &[])).is_empty());
     }
 
     #[test]

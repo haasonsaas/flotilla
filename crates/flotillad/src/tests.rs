@@ -9,7 +9,6 @@ use flotilla_core::keys;
 use flotilla_core::schema::*;
 use flotilla_core::Store;
 use futures::StreamExt;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +67,7 @@ async fn node(name: &str, port: u16, peers: Vec<(&str, u16)>, dir: &std::path::P
     tokio::spawn(async move {
         axum::serve(
             listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+            app.into_make_service_with_connect_info::<crate::auth::ClientAddr>(),
         )
         .await
         .unwrap()
@@ -77,6 +76,77 @@ async fn node(name: &str, port: u16, peers: Vec<(&str, u16)>, dir: &std::path::P
     tokio::spawn(crate::sync_loop::run(state.clone()));
     tokio::spawn(crate::scheduler::run(state.clone()));
     tokio::spawn(crate::reconcile::run(state.clone()));
+    Node {
+        state,
+        base: format!("http://127.0.0.1:{port}"),
+        http: reqwest::Client::new(),
+    }
+}
+
+type TailnetSpec<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str, u16)>);
+
+/// Like `node`, on several tailnets. Each tailnet is (name, this node's id
+/// on it, peers visible there as (peer's id on that tailnet, name, port)).
+async fn node_on_tailnets(
+    name: &str,
+    port: u16,
+    tailnets: Vec<TailnetSpec<'_>>,
+    dir: &std::path::Path,
+) -> Node {
+    use crate::config::TailnetConfig;
+    let cfg = Config {
+        port,
+        data_dir: dir.join(name),
+        identity: "static".into(),
+        sync_interval_secs: 1,
+        job_lease_secs: 3,
+        facts_interval_secs: 1,
+        scheduler_interval_secs: 1,
+        reconcile_interval_secs: 1,
+        tailnet: tailnets
+            .into_iter()
+            .map(|(tn, my_id, peers)| TailnetConfig {
+                name: tn.into(),
+                static_identity: Some(StaticIdentityConfig {
+                    node_id: my_id.into(),
+                    name: name.into(),
+                    ips: vec![],
+                    login: "static@local".into(),
+                    peers: peers
+                        .into_iter()
+                        .map(|(id, n, p)| StaticPeer {
+                            node_id: id.into(),
+                            name: n.into(),
+                            ips: vec!["127.0.0.1".into()],
+                            port: Some(p),
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            })
+            .collect(),
+        ..Config::default()
+    };
+    std::fs::create_dir_all(cfg.jobs_dir()).unwrap();
+    let identity = Arc::new(IdentityProvider::from_config(&cfg).unwrap());
+    let me = identity.me().await.unwrap();
+    let store =
+        Arc::new(Store::open(&cfg.data_dir.join("store.redb"), me.node_id.clone()).unwrap());
+    let state = AppState::new(Arc::new(cfg), identity, store, me);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<crate::auth::ClientAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    tokio::spawn(crate::facts::run(state.clone()));
+    tokio::spawn(crate::sync_loop::run(state.clone()));
     Node {
         state,
         base: format!("http://127.0.0.1:{port}"),
@@ -1293,4 +1363,149 @@ async fn job_artifacts_are_listed_and_served() {
     assert_eq!(r.superseded, all.records.len());
     assert!(a.state.store.get("restored/x").unwrap().is_some());
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// A node on two tailnets bridges nodes that share no tailnet: `a` (tailnet
+/// x) and `b` (tailnet y) only see `m`, yet each ends up with the other's
+/// facts. `m` has a different id on each tailnet; the peer lists must be
+/// folded back onto `m`'s fleet id so nothing is duplicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_on_two_tailnets_bridges_the_fleet() {
+    let dir = tmp();
+    let (pa, pb, pm) = (free_port().await, free_port().await, free_port().await);
+    let a = node_on_tailnets(
+        "a",
+        pa,
+        vec![("x", "id-a", vec![("m-on-x", "m", pm)])],
+        &dir,
+    )
+    .await;
+    let b = node_on_tailnets(
+        "b",
+        pb,
+        vec![("y", "id-b", vec![("m-on-y", "m", pm)])],
+        &dir,
+    )
+    .await;
+    let m = node_on_tailnets(
+        "m",
+        pm,
+        vec![
+            ("x", "m-on-x", vec![("id-a", "a", pa)]),
+            ("y", "m-on-y", vec![("id-b", "b", pb)]),
+        ],
+        &dir,
+    )
+    .await;
+
+    eventually("a and b learn each other through m", || {
+        a.state
+            .store
+            .get(&keys::node_facts("m-on-x"))
+            .unwrap()
+            .is_some()
+            && a.state
+                .store
+                .get(&keys::node_facts("id-b"))
+                .unwrap()
+                .is_some()
+            && b.state
+                .store
+                .get(&keys::node_facts("id-a"))
+                .unwrap()
+                .is_some()
+    })
+    .await;
+
+    // m's fleet id is its primary tailnet's id, and its facts list both.
+    let facts: NodeFacts = a
+        .state
+        .store
+        .get(&keys::node_facts("m-on-x"))
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tn: Vec<_> = facts
+        .tailnets
+        .iter()
+        .map(|t| (t.name.as_str(), t.node_id.as_str()))
+        .collect();
+    assert_eq!(tn, vec![("x", "m-on-x"), ("y", "m-on-y")]);
+
+    // b reached m via tailnet y's id and folds it onto m's fleet id.
+    eventually("b maps m-on-y onto m's fleet id", || {
+        b.state
+            .tailnet_index()
+            .get(&("y".to_string(), "m-on-y".to_string()))
+            == Some(&"m-on-x".to_string())
+    })
+    .await;
+    let cands = crate::sync_loop::candidates(&b.state).await.unwrap();
+    assert_eq!(
+        cands.len(),
+        1,
+        "one candidate for m, not one per tailnet: {cands:?}"
+    );
+    assert_eq!(cands[0].key, "m-on-x");
+
+    // b's status shows m online once, and a as a fleet member.
+    let st: StatusResponse = b
+        .http
+        .get(format!("{}/v1/status", b.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<_> = st.nodes.iter().map(|n| n.facts.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b", "m"]);
+    let mn = st.nodes.iter().find(|n| n.facts.name == "m").unwrap();
+    assert!(mn.online);
+    drop(m);
+}
+
+/// A userspace tailscaled forwards tailnet connections to a loopback port with a
+/// PROXY header; the request must be seen as coming from the header's address.
+#[tokio::test]
+async fn proxy_listener_reports_the_header_source() {
+    use axum::extract::ConnectInfo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = inner.local_addr().unwrap();
+    let listener = crate::proxyproto::ProxyListener::new(inner).unwrap();
+    let app = axum::Router::new().route(
+        "/who",
+        axum::routing::get(
+            |ConnectInfo(a): ConnectInfo<crate::auth::ClientAddr>| async move { a.0.to_string() },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<crate::auth::ClientAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"PROXY TCP4 100.64.7.7 100.64.0.1 40000 7400\r\nGET /who HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.ends_with("100.64.7.7:40000"), "got {out:?}");
+
+    // A connection that sends no PROXY header is dropped, not served.
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /who HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out).await;
+    assert!(
+        !out.contains("200 OK"),
+        "unproxied request was served: {out:?}"
+    );
 }

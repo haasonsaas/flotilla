@@ -55,11 +55,13 @@ impl AppState {
         store.on_change(move |r| {
             let _ = tx.send(RecordEvent::from(r));
         });
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .build()
-            .expect("reqwest client");
+            .connect_timeout(std::time::Duration::from_secs(3));
+        if let Some(proxy) = identity.proxy() {
+            http = http.proxy(proxy);
+        }
+        let http = http.build().expect("reqwest client");
         AppState {
             cfg,
             identity,
@@ -77,6 +79,36 @@ impl AppState {
         let mut v: Vec<String> = self.running.lock().unwrap().keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Base URL for a node, dialing an address on a tailnet we share.
+    pub fn facts_url(&self, f: &NodeFacts) -> Option<String> {
+        let ips = flotilla_core::api::dial_ips(&self.me.tailnets, &f.tailnets, &f.tailscale_ips);
+        peer_url(&ips, f.port)
+    }
+
+    /// Fleet node id for a peer as one tailnet's peer list names it. The
+    /// same machine has a different id on each tailnet; a node's facts list
+    /// them all, so map back to the id its facts are keyed by.
+    pub fn canonical_id(&self, index: &HashMap<(String, String), String>, p: &PeerInfo) -> String {
+        index
+            .get(&(p.tailnet.clone(), p.node_id.clone()))
+            .cloned()
+            .unwrap_or_else(|| p.node_id.clone())
+    }
+
+    /// (tailnet name, tailnet-local node id) -> fleet node id, from every
+    /// known node's facts.
+    pub fn tailnet_index(&self) -> HashMap<(String, String), String> {
+        let mut m = HashMap::new();
+        for rec in self.store.list(keys::NODE).unwrap_or_default() {
+            if let Ok(f) = rec.parse::<NodeFacts>() {
+                for t in &f.tailnets {
+                    m.insert((t.name.clone(), t.node_id.clone()), f.node_id.clone());
+                }
+            }
+        }
+        m
     }
 
     /// Facts for this node as last written (labels are needed by the scheduler).
@@ -167,24 +199,45 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub async fn serve(state: AppState) -> Result<()> {
-    let mut addrs: Vec<SocketAddr> = vec![SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        state.cfg.port,
+    use crate::auth::TailnetCtx;
+    use crate::proxyproto::ProxyListener;
+    let app = router(state.clone());
+    // (address, tailnet index) for plain TCP listeners.
+    let mut addrs: Vec<(SocketAddr, usize)> = vec![(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), state.cfg.port),
+        0,
     )];
-    for ip in &state.me.ips {
-        addrs.push(SocketAddr::new(*ip, state.cfg.port));
+    let mut proxied: Vec<(String, usize)> = Vec::new();
+    for (i, t) in state.me.tailnets.iter().enumerate() {
+        let idx = state.identity.tailnet_index(&t.name).unwrap_or(i);
+        let conf = state.identity.tailnet_conf(idx);
+        if let Some(listen) = conf.and_then(|c| c.proxy_listen.clone()) {
+            // Userspace tailnet: its addresses are not local interfaces.
+            proxied.push((listen, idx));
+            continue;
+        }
+        for ip in &t.ips {
+            if let Ok(ip) = ip.parse::<IpAddr>() {
+                addrs.push((SocketAddr::new(ip, state.cfg.port), idx));
+            }
+        }
+    }
+    if state.me.tailnets.is_empty() {
+        for ip in &state.me.ips {
+            addrs.push((SocketAddr::new(*ip, state.cfg.port), 0));
+        }
     }
     for extra in &state.cfg.listen {
-        addrs.push(
+        addrs.push((
             extra
                 .parse()
                 .with_context(|| format!("bad listen address {extra:?}"))?,
-        );
+            0,
+        ));
     }
     addrs.dedup();
-    let app = router(state);
     let mut tasks = Vec::new();
-    for addr in addrs {
+    for (addr, idx) in addrs {
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -192,12 +245,31 @@ pub async fn serve(state: AppState) -> Result<()> {
                 continue;
             }
         };
-        tracing::info!(%addr, "listening");
-        let app = app.clone();
+        tracing::info!(%addr, tailnet = idx, "listening");
+        let app = app.clone().layer(Extension(TailnetCtx(idx)));
         tasks.push(tokio::spawn(async move {
             axum::serve(
                 listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
+                app.into_make_service_with_connect_info::<auth::ClientAddr>(),
+            )
+            .await
+        }));
+    }
+    for (listen, idx) in proxied {
+        let listener = match tokio::net::TcpListener::bind(&listen).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(%listen, error = %e, "proxy listener bind failed, skipping");
+                continue;
+            }
+        };
+        tracing::info!(%listen, tailnet = idx, "listening (PROXY protocol)");
+        let listener = ProxyListener::new(listener)?;
+        let app = app.clone().layer(Extension(TailnetCtx(idx)));
+        tasks.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<auth::ClientAddr>(),
             )
             .await
         }));
@@ -216,6 +288,7 @@ fn self_info(state: &AppState) -> SelfInfo {
         version: crate::VERSION.to_string(),
         tailscale_ips: state.me.ips.iter().map(ToString::to_string).collect(),
         port: state.cfg.port,
+        tailnets: state.me.tailnets.clone(),
     }
 }
 
@@ -232,13 +305,14 @@ async fn get_peers(State(state): State<AppState>) -> ApiResult<Json<PeersRespons
 }
 
 async fn get_status(State(state): State<AppState>) -> ApiResult<Json<StatusResponse>> {
+    let index = state.tailnet_index();
     let online: HashSet<String> = state
         .identity
         .peers()
         .await?
-        .into_iter()
+        .iter()
         .filter(|p| p.online)
-        .map(|p| p.node_id)
+        .map(|p| state.canonical_id(&index, p))
         .collect();
     let now = flotilla_core::now_ms();
     let mut nodes = Vec::new();
@@ -405,7 +479,7 @@ fn executor_url(state: &AppState, id: &str) -> Option<(String, String)> {
         .ok()
         .flatten()
         .and_then(|r| r.parse::<NodeFacts>().ok())?;
-    peer_url(&facts.tailscale_ips, facts.port).map(|u| (claim.node, u))
+    state.facts_url(&facts).map(|u| (claim.node, u))
 }
 
 fn valid_job_id(id: &str) -> bool {
@@ -622,7 +696,7 @@ async fn get_job_log(
                 .store
                 .get(&keys::node_facts(&claim.node))?
                 .and_then(|r| r.parse::<NodeFacts>().ok());
-            let Some(url) = facts.and_then(|f| peer_url(&f.tailscale_ips, f.port)) else {
+            let Some(url) = facts.and_then(|f| state.facts_url(&f)) else {
                 return Ok((StatusCode::NOT_FOUND, "executor unknown").into_response());
             };
             let mut req = state

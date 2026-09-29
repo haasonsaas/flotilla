@@ -7,6 +7,7 @@ mod facts;
 mod gc;
 mod identity;
 mod notify;
+mod proxyproto;
 mod reconcile;
 mod scheduler;
 mod server;
@@ -60,9 +61,24 @@ async fn main() -> Result<()> {
     let identity = Arc::new(identity::IdentityProvider::from_config(&cfg)?);
     let me = identity.me().await.context("resolving own identity")?;
     if cfg.allowed_users.is_empty() && cfg.allowed_tags.is_empty() {
-        if let Some(login) = identity.own_login().await? {
+        if let Some(login) = identity.own_login_in(0).await? {
             tracing::info!(login, "no allowed_users configured; allowing own login");
             cfg.allowed_users.push(login);
+        }
+    }
+    // A tailnet with no lists of its own and no global ones falls back to
+    // the owner of this node on that tailnet.
+    for i in 1..cfg.tailnet.len() {
+        let t = &cfg.tailnet[i];
+        if cfg.allowed_users.is_empty()
+            && cfg.allowed_tags.is_empty()
+            && t.allowed_users.is_none()
+            && t.allowed_tags.is_none()
+        {
+            if let Ok(Some(login)) = identity.own_login_in(i).await {
+                tracing::info!(tailnet = %t.name, login, "allowing own login on tailnet");
+                cfg.tailnet[i].allowed_users = Some(vec![login]);
+            }
         }
     }
     let cfg = Arc::new(cfg);

@@ -1,14 +1,15 @@
 //! Who am I, who are my peers, who is calling. Backed by the tailscale CLI
 //! in production and by static config in tests.
 
-use crate::config::{Config, StaticIdentityConfig};
+use crate::config::{Config, StaticIdentityConfig, TailnetConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use flotilla_core::api::PeerInfo;
+use flotilla_core::schema::TailnetInfo;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
@@ -18,7 +19,11 @@ pub struct NodeInfo {
     pub name: String,
     pub hostname: String,
     pub os: String,
+    /// Addresses on every active tailnet, primary tailnet first.
     pub ips: Vec<IpAddr>,
+    /// Per-tailnet presence, primary first. The primary's `node_id` is
+    /// `node_id` above.
+    pub tailnets: Vec<TailnetInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,53 +37,37 @@ pub struct WhoIs {
     pub caps: std::collections::BTreeMap<String, Vec<Value>>,
 }
 
-pub enum IdentityProvider {
+/// One tailnet's source of identity.
+enum Backend {
     Tailscale(Tailscale),
     Static(StaticIdentity),
 }
 
-impl IdentityProvider {
-    pub fn from_config(cfg: &Config) -> Result<IdentityProvider> {
-        match cfg.identity.as_str() {
-            "tailscale" => Ok(IdentityProvider::Tailscale(Tailscale::new(
-                cfg.tailscale_bin.clone(),
-            )?)),
-            "static" => {
-                let sc = cfg
-                    .static_identity
-                    .clone()
-                    .ok_or_else(|| anyhow!("identity=static needs [static_identity]"))?;
-                Ok(IdentityProvider::Static(StaticIdentity::new(sc)?))
-            }
-            other => bail!("unknown identity provider {other:?}"),
+impl Backend {
+    async fn me(&self) -> Result<NodeInfo> {
+        match self {
+            Backend::Tailscale(t) => t.me().await,
+            Backend::Static(s) => Ok(s.me.clone()),
         }
     }
 
-    pub async fn me(&self) -> Result<NodeInfo> {
+    async fn peers(&self) -> Result<Vec<PeerInfo>> {
         match self {
-            IdentityProvider::Tailscale(t) => t.me().await,
-            IdentityProvider::Static(s) => Ok(s.me.clone()),
+            Backend::Tailscale(t) => t.peers().await,
+            Backend::Static(s) => Ok(s.peers.clone()),
         }
     }
 
-    pub async fn peers(&self) -> Result<Vec<PeerInfo>> {
+    async fn whois(&self, ip: IpAddr) -> Result<Option<WhoIs>> {
         match self {
-            IdentityProvider::Tailscale(t) => t.peers().await,
-            IdentityProvider::Static(s) => Ok(s.peers.clone()),
+            Backend::Tailscale(t) => t.whois(ip).await,
+            Backend::Static(s) => Ok(s.whois(ip)),
         }
     }
 
-    pub async fn whois(&self, ip: IpAddr) -> Result<Option<WhoIs>> {
+    async fn own_login(&self) -> Result<Option<String>> {
         match self {
-            IdentityProvider::Tailscale(t) => t.whois(ip).await,
-            IdentityProvider::Static(s) => Ok(s.whois(ip)),
-        }
-    }
-
-    /// Login name of this node's own user, for the default allow-list.
-    pub async fn own_login(&self) -> Result<Option<String>> {
-        match self {
-            IdentityProvider::Tailscale(t) => {
+            Backend::Tailscale(t) => {
                 let me = t.me().await?;
                 for ip in me.ips {
                     if let Some(w) = t.whois(ip).await? {
@@ -87,8 +76,224 @@ impl IdentityProvider {
                 }
                 Ok(None)
             }
-            IdentityProvider::Static(s) => Ok(Some(s.login.clone())),
+            Backend::Static(s) => Ok(Some(s.login.clone())),
         }
+    }
+}
+
+struct Handle {
+    name: String,
+    conf: TailnetConfig,
+    backend: Backend,
+}
+
+/// Tailnet name -> (peer addresses, proxy URL).
+type ProxyRoutes = HashMap<String, (Vec<IpAddr>, String)>;
+
+/// Who am I, who are my peers, who is calling, across every tailnet this
+/// node is on. Tailnet 0 is the primary: its node id is the fleet identity.
+pub struct IdentityProvider {
+    tailnets: Vec<Handle>,
+    name_override: Option<String>,
+    /// tailnet name -> (peer addresses, socks5 URL) for userspace tailnets,
+    /// refreshed on every peer list.
+    routes: Arc<RwLock<ProxyRoutes>>,
+}
+
+/// How long a secondary tailnet gets to come up at startup (its tailscaled
+/// may still be starting after a reboot) before the daemon runs without it.
+const SECONDARY_WAIT: Duration = Duration::from_secs(30);
+
+impl IdentityProvider {
+    pub fn from_config(cfg: &Config) -> Result<IdentityProvider> {
+        let confs: Vec<TailnetConfig> = if cfg.tailnet.is_empty() {
+            vec![TailnetConfig {
+                name: "default".into(),
+                static_identity: cfg.static_identity.clone(),
+                ..Default::default()
+            }]
+        } else {
+            cfg.tailnet.clone()
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut tailnets = Vec::new();
+        for mut conf in confs {
+            if conf.name.is_empty() {
+                if cfg.tailnet.len() > 1 {
+                    bail!("every [[tailnet]] needs a name");
+                }
+                conf.name = "default".into();
+            }
+            if !seen.insert(conf.name.clone()) {
+                bail!("duplicate tailnet name {:?}", conf.name);
+            }
+            let backend = match cfg.identity.as_str() {
+                "tailscale" => Backend::Tailscale(Tailscale::new(
+                    conf.bin.clone().or_else(|| cfg.tailscale_bin.clone()),
+                    conf.socket.clone(),
+                )?),
+                "static" => {
+                    let sc = conf
+                        .static_identity
+                        .clone()
+                        .ok_or_else(|| anyhow!("identity=static needs [static_identity]"))?;
+                    Backend::Static(StaticIdentity::new(sc)?)
+                }
+                other => bail!("unknown identity provider {other:?}"),
+            };
+            tailnets.push(Handle {
+                name: conf.name.clone(),
+                conf,
+                backend,
+            });
+        }
+        Ok(IdentityProvider {
+            tailnets,
+            name_override: cfg.name.clone(),
+            routes: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    pub fn tailnet_conf(&self, idx: usize) -> Option<&TailnetConfig> {
+        self.tailnets.get(idx).map(|h| &h.conf)
+    }
+
+    pub fn tailnet_index(&self, name: &str) -> Option<usize> {
+        self.tailnets.iter().position(|h| h.name == name)
+    }
+
+    /// This node: the primary tailnet's identity plus its presence on every
+    /// secondary tailnet that is up. Secondaries that are down or logged out
+    /// are skipped (with a warning) after a grace period.
+    pub async fn me(&self) -> Result<NodeInfo> {
+        let mut primary = self.tailnets[0].backend.me().await?;
+        let mut tailnets = vec![TailnetInfo {
+            name: self.tailnets[0].name.clone(),
+            node_id: primary.node_id.clone(),
+            ips: primary.ips.iter().map(ToString::to_string).collect(),
+        }];
+        let mut ips = primary.ips.clone();
+        for h in &self.tailnets[1..] {
+            let deadline = Instant::now() + SECONDARY_WAIT;
+            let n = loop {
+                let r = h.backend.me().await;
+                let ready = match &r {
+                    Ok(n) => !n.ips.is_empty() || matches!(h.backend, Backend::Static(_)),
+                    Err(_) => false,
+                };
+                if ready {
+                    break r.ok();
+                }
+                if Instant::now() >= deadline {
+                    tracing::warn!(tailnet = %h.name, error = ?r.err(), "tailnet is not up; running without it");
+                    break None;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            };
+            if let Some(n) = n {
+                ips.extend(n.ips.iter().copied());
+                tailnets.push(TailnetInfo {
+                    name: h.name.clone(),
+                    node_id: n.node_id,
+                    ips: n.ips.iter().map(ToString::to_string).collect(),
+                });
+            }
+        }
+        primary.ips = ips;
+        primary.tailnets = tailnets;
+        if let Some(n) = &self.name_override {
+            primary.name = n.clone();
+        }
+        Ok(primary)
+    }
+
+    /// Peers from every tailnet, each tagged with the tailnet that reported
+    /// it. One tailnet failing does not hide the others.
+    pub async fn peers(&self) -> Result<Vec<PeerInfo>> {
+        let mut out = Vec::new();
+        let mut first_err = None;
+        let mut ok = false;
+        for h in &self.tailnets {
+            match h.backend.peers().await {
+                Ok(peers) => {
+                    ok = true;
+                    if let Some(proxy) = h.conf.proxy_url() {
+                        let ips = peers
+                            .iter()
+                            .flat_map(|p| p.ips.iter())
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        self.routes
+                            .write()
+                            .unwrap()
+                            .insert(h.name.clone(), (ips, proxy));
+                    }
+                    out.extend(peers.into_iter().map(|mut p| {
+                        p.tailnet = h.name.clone();
+                        p
+                    }));
+                }
+                Err(e) => {
+                    tracing::debug!(tailnet = %h.name, error = %e, "peer list failed");
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        match (ok, first_err) {
+            (false, Some(e)) => Err(e),
+            _ => Ok(out),
+        }
+    }
+
+    /// Who owns `ip`, according to tailnet `idx`. Addresses can overlap
+    /// between tailnets, so callers must say which tailnet the connection
+    /// arrived on.
+    pub async fn whois_in(&self, idx: usize, ip: IpAddr) -> Result<Option<WhoIs>> {
+        match self.tailnets.get(idx) {
+            Some(h) => h.backend.whois(ip).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Login name of tailnet `idx`'s own user, for the default allow-list.
+    pub async fn own_login_in(&self, idx: usize) -> Result<Option<String>> {
+        match self.tailnets.get(idx) {
+            Some(h) => h.backend.own_login().await,
+            None => Ok(None),
+        }
+    }
+
+    /// Route requests to peers of userspace-networking tailnets through
+    /// their SOCKS5 servers. None when no tailnet needs it.
+    pub fn proxy(&self) -> Option<reqwest::Proxy> {
+        let proxied: Vec<String> = self
+            .tailnets
+            .iter()
+            .filter_map(|h| h.conf.proxy_url())
+            .collect();
+        if proxied.is_empty() {
+            return None;
+        }
+        let routes = self.routes.clone();
+        Some(reqwest::Proxy::custom(move |url| {
+            let ip: IpAddr = url
+                .host_str()?
+                .trim_matches(|c| c == '[' || c == ']')
+                .parse()
+                .ok()?;
+            let known = routes
+                .read()
+                .unwrap()
+                .values()
+                .find(|(ips, _)| ips.contains(&ip))
+                .map(|(_, proxy)| proxy.clone());
+            // An address not (yet) in any peer list, e.g. a configured seed,
+            // still has to go through the proxy if only one tailnet has one.
+            let chosen = known.or_else(|| {
+                (proxied.len() == 1 && in_tailscale_range(ip)).then(|| proxied[0].clone())
+            })?;
+            chosen.parse::<reqwest::Url>().ok()
+        }))
     }
 }
 
@@ -96,6 +301,7 @@ impl IdentityProvider {
 
 pub struct Tailscale {
     bin: PathBuf,
+    socket: Option<PathBuf>,
     status_cache: Arc<Mutex<Option<(Instant, Value)>>>,
     /// Set while a background refresh of the status cache is in flight.
     refreshing: Arc<std::sync::atomic::AtomicBool>,
@@ -109,7 +315,7 @@ const WHOIS_TTL: Duration = Duration::from_secs(20);
 const CLI_TIMEOUT: Duration = Duration::from_secs(8);
 
 impl Tailscale {
-    pub fn new(bin: Option<PathBuf>) -> Result<Tailscale> {
+    pub fn new(bin: Option<PathBuf>, socket: Option<PathBuf>) -> Result<Tailscale> {
         let bin = match bin {
             Some(b) => b,
             None => find_tailscale()
@@ -117,6 +323,7 @@ impl Tailscale {
         };
         Ok(Tailscale {
             bin,
+            socket,
             status_cache: Arc::new(Mutex::new(None)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             whois_cache: Mutex::new(HashMap::new()),
@@ -124,14 +331,20 @@ impl Tailscale {
     }
 
     async fn run(&self, args: &[&str]) -> Result<Value> {
-        run_cli(&self.bin, args).await
+        run_cli(&self.bin, self.socket.as_deref(), args).await
     }
 }
 
 /// One `tailscale` invocation, bounded by CLI_TIMEOUT.
-async fn run_cli(bin: &std::path::Path, args: &[&str]) -> Result<Value> {
+async fn run_cli(bin: &Path, socket: Option<&Path>, args: &[&str]) -> Result<Value> {
     {
-        let out = tokio::time::timeout(CLI_TIMEOUT, Command::new(bin).args(args).output())
+        let mut cmd = Command::new(bin);
+        if let Some(sock) = socket {
+            let mut flag = std::ffi::OsString::from("--socket=");
+            flag.push(sock);
+            cmd.arg(flag);
+        }
+        let out = tokio::time::timeout(CLI_TIMEOUT, cmd.args(args).output())
             .await
             .with_context(|| format!("tailscale {:?} timed out after {:?}", args, CLI_TIMEOUT))?
             .with_context(|| format!("running {}", bin.display()))?;
@@ -160,7 +373,7 @@ impl Tailscale {
                 Ok(v)
             }
             None => {
-                let v = run_cli(&self.bin, &["status", "--json"]).await?;
+                let v = run_cli(&self.bin, self.socket.as_deref(), &["status", "--json"]).await?;
                 *self.status_cache.lock().unwrap() = Some((Instant::now(), v.clone()));
                 Ok(v)
             }
@@ -173,10 +386,11 @@ impl Tailscale {
             return;
         }
         let bin = self.bin.clone();
+        let socket = self.socket.clone();
         let cache = self.status_cache.clone();
         let flag = self.refreshing.clone();
         tokio::spawn(async move {
-            match run_cli(&bin, &["status", "--json"]).await {
+            match run_cli(&bin, socket.as_deref(), &["status", "--json"]).await {
                 Ok(v) => *cache.lock().unwrap() = Some((Instant::now(), v)),
                 Err(e) => {
                     if age > STATUS_TTL * 6 {
@@ -207,6 +421,7 @@ impl Tailscale {
                 .unwrap_or("")
                 .to_string(),
             ips: ips_of(s),
+            tailnets: Vec::new(),
         })
     }
 
@@ -235,6 +450,7 @@ impl Tailscale {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    tailnet: String::new(),
                 });
             }
         }
@@ -306,6 +522,17 @@ impl Tailscale {
     }
 }
 
+/// 100.64.0.0/10 or fd7a:115c:a1e0::/48, the ranges Tailscale hands out.
+fn in_tailscale_range(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xc0) == 64
+        }
+        IpAddr::V6(v6) => v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
 fn str_field(v: &Value, k: &str) -> Result<String> {
     v.get(k)
         .and_then(Value::as_str)
@@ -373,6 +600,7 @@ impl StaticIdentity {
             hostname: sc.name.clone(),
             os: std::env::consts::OS.to_string(),
             ips: sc.ips.iter().map(|s| s.parse()).collect::<Result<_, _>>()?,
+            tailnets: Vec::new(),
         };
         let mut by_ip = HashMap::new();
         for ip in &me.ips {
@@ -416,6 +644,7 @@ impl StaticIdentity {
                     .collect(),
                 os: std::env::consts::OS.to_string(),
                 tags: vec![],
+                tailnet: String::new(),
             });
         }
         Ok(StaticIdentity {
@@ -446,6 +675,7 @@ impl StaticIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StaticIdentityConfig;
 
     #[test]
     fn short_names() {
@@ -454,6 +684,176 @@ mod tests {
             "jonathan-air"
         );
         assert_eq!(short_name("plain"), "plain");
+    }
+
+    fn static_tailnet(
+        name: &str,
+        me_id: &str,
+        ips: &[&str],
+        peers: &[(&str, &str, &str)],
+    ) -> TailnetConfig {
+        TailnetConfig {
+            name: name.into(),
+            static_identity: Some(StaticIdentityConfig {
+                node_id: me_id.into(),
+                name: "box".into(),
+                ips: ips.iter().map(|s| s.to_string()).collect(),
+                login: format!("{name}-user@example.com"),
+                peers: peers
+                    .iter()
+                    .map(|(id, n, ip)| crate::config::StaticPeer {
+                        node_id: id.to_string(),
+                        name: n.to_string(),
+                        ips: vec![ip.to_string()],
+                        port: None,
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn two_tailnets() -> IdentityProvider {
+        // Both tailnets hand out 100.64.0.5, to different machines.
+        let cfg = Config {
+            identity: "static".into(),
+            name: Some("boxname".into()),
+            tailnet: vec![
+                static_tailnet(
+                    "evalops",
+                    "e-1",
+                    &["100.64.0.1"],
+                    &[("e-p", "peer-e", "100.64.0.5")],
+                ),
+                static_tailnet(
+                    "homelab",
+                    "h-1",
+                    &["100.99.0.1"],
+                    &[("h-p", "peer-h", "100.64.0.5")],
+                ),
+            ],
+            ..Config::default()
+        };
+        IdentityProvider::from_config(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn me_merges_tailnets_primary_first() {
+        let id = two_tailnets();
+        let me = id.me().await.unwrap();
+        assert_eq!(me.node_id, "e-1", "primary tailnet's id is the fleet id");
+        assert_eq!(me.name, "boxname", "name override applies");
+        assert_eq!(
+            me.ips,
+            vec![
+                "100.64.0.1".parse::<IpAddr>().unwrap(),
+                "100.99.0.1".parse().unwrap()
+            ]
+        );
+        let names: Vec<_> = me
+            .tailnets
+            .iter()
+            .map(|t| (t.name.as_str(), t.node_id.as_str()))
+            .collect();
+        assert_eq!(names, vec![("evalops", "e-1"), ("homelab", "h-1")]);
+    }
+
+    #[tokio::test]
+    async fn peers_are_merged_and_tagged_by_tailnet() {
+        let id = two_tailnets();
+        let peers = id.peers().await.unwrap();
+        let got: Vec<_> = peers
+            .iter()
+            .map(|p| (p.name.as_str(), p.tailnet.as_str()))
+            .collect();
+        assert_eq!(got, vec![("peer-e", "evalops"), ("peer-h", "homelab")]);
+    }
+
+    #[tokio::test]
+    async fn whois_is_asked_of_the_tailnet_the_caller_arrived_on() {
+        let id = two_tailnets();
+        let ip: IpAddr = "100.64.0.5".parse().unwrap();
+        let e = id.whois_in(0, ip).await.unwrap().unwrap();
+        let h = id.whois_in(1, ip).await.unwrap().unwrap();
+        assert_eq!(
+            (e.node_id.as_str(), e.login.as_str()),
+            ("e-p", "evalops-user@example.com")
+        );
+        assert_eq!(
+            (h.node_id.as_str(), h.login.as_str()),
+            ("h-p", "homelab-user@example.com")
+        );
+        assert!(id.whois_in(7, ip).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dead_primary_tailnet_is_fatal() {
+        let cfg = Config {
+            identity: "tailscale".into(),
+            tailscale_bin: Some(PathBuf::from("/bin/false")),
+            tailnet: vec![TailnetConfig {
+                name: "only".into(),
+                ..Default::default()
+            }],
+            ..Config::default()
+        };
+        let id = IdentityProvider::from_config(&cfg).unwrap();
+        assert!(id.me().await.is_err(), "a dead primary is fatal");
+    }
+
+    #[test]
+    fn tailnet_names_must_be_unique_and_present() {
+        let dup = Config {
+            identity: "static".into(),
+            tailnet: vec![
+                static_tailnet("a", "1", &[], &[]),
+                static_tailnet("a", "2", &[], &[]),
+            ],
+            ..Config::default()
+        };
+        assert!(IdentityProvider::from_config(&dup).is_err());
+        let unnamed = Config {
+            identity: "static".into(),
+            tailnet: vec![
+                static_tailnet("", "1", &[], &[]),
+                static_tailnet("b", "2", &[], &[]),
+            ],
+            ..Config::default()
+        };
+        assert!(IdentityProvider::from_config(&unnamed).is_err());
+    }
+
+    #[test]
+    fn tailscale_range() {
+        assert!(in_tailscale_range("100.64.0.1".parse().unwrap()));
+        assert!(in_tailscale_range("100.127.255.1".parse().unwrap()));
+        assert!(!in_tailscale_range("100.128.0.1".parse().unwrap()));
+        assert!(!in_tailscale_range("10.0.0.1".parse().unwrap()));
+        assert!(in_tailscale_range("fd7a:115c:a1e0::1".parse().unwrap()));
+        assert!(!in_tailscale_range("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn proxy_routes_only_tailscale_addresses() {
+        let cfg = Config {
+            identity: "static".into(),
+            tailnet: vec![TailnetConfig {
+                proxy: Some("http://127.0.0.1:1057".into()),
+                ..static_tailnet("evalops", "e-1", &[], &[])
+            }],
+            ..Config::default()
+        };
+        let id = IdentityProvider::from_config(&cfg).unwrap();
+        assert!(id.proxy().is_some());
+        let plain = Config {
+            identity: "static".into(),
+            tailnet: vec![static_tailnet("evalops", "e-1", &[], &[])],
+            ..Config::default()
+        };
+        assert!(IdentityProvider::from_config(&plain)
+            .unwrap()
+            .proxy()
+            .is_none());
     }
 
     #[test]
@@ -466,6 +866,7 @@ mod tests {
         });
         let ts = Tailscale {
             bin: PathBuf::from("/bin/false"),
+            socket: None,
             status_cache: Arc::new(Mutex::new(Some((Instant::now(), v)))),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             whois_cache: Mutex::new(HashMap::new()),

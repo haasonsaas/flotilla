@@ -1,7 +1,7 @@
 //! Wire types for the daemon's HTTP API, shared by daemon and CLI.
 
 use crate::record::Record;
-use crate::schema::NodeFacts;
+use crate::schema::{NodeFacts, TailnetInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -14,6 +14,8 @@ pub struct SelfInfo {
     pub version: String,
     pub tailscale_ips: Vec<String>,
     pub port: u16,
+    #[serde(default)]
+    pub tailnets: Vec<TailnetInfo>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,6 +27,10 @@ pub struct PeerInfo {
     pub os: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Which of this node's tailnets reported the peer. Empty for a
+    /// single-tailnet daemon that predates multi-tailnet support.
+    #[serde(default)]
+    pub tailnet: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,9 +123,48 @@ pub fn peer_url(ips: &[String], default_port: u16) -> Option<String> {
         .find_map(|s| base_url(s, default_port))
 }
 
+/// Addresses to dial a node with, given the tailnets we are on and the ones
+/// it advertises. Addresses on tailnets we share come first (and alone, since
+/// an address on a tailnet we are not on cannot be reached). A node that
+/// advertises no tailnets, or shares none with us, falls back to `all`.
+pub fn dial_ips(mine: &[TailnetInfo], theirs: &[TailnetInfo], all: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in mine {
+        for t in theirs.iter().filter(|t| t.name == m.name) {
+            out.extend(t.ips.iter().cloned());
+        }
+    }
+    if out.is_empty() {
+        all.to_vec()
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tn(name: &str, ips: &[&str]) -> TailnetInfo {
+        TailnetInfo {
+            name: name.into(),
+            node_id: format!("id-{name}"),
+            ips: ips.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn dial_ips_prefers_shared_tailnets() {
+        let mine = vec![tn("evalops", &["100.1.1.1"])];
+        let theirs = vec![tn("homelab", &["100.9.9.9"]), tn("evalops", &["100.2.2.2"])];
+        let all = vec!["100.9.9.9".to_string(), "100.2.2.2".to_string()];
+        assert_eq!(dial_ips(&mine, &theirs, &all), vec!["100.2.2.2"]);
+        // no shared tailnet: fall back to everything advertised
+        let other = vec![tn("elsewhere", &["100.5.5.5"])];
+        assert_eq!(dial_ips(&other, &theirs, &all), all);
+        // old daemon advertising no tailnets
+        assert_eq!(dial_ips(&mine, &[], &all), all);
+    }
 
     #[test]
     fn urls() {

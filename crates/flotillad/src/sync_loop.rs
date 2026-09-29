@@ -36,24 +36,29 @@ pub async fn run(state: AppState) {
 /// Every peer we could sync with right now, ignoring backoff.
 pub async fn candidates(state: &AppState) -> anyhow::Result<Vec<Candidate>> {
     let peers = state.identity.peers().await?;
-    let mut out = Vec::new();
-    for p in peers
-        .into_iter()
-        .filter(|p| p.online && p.node_id != state.me.node_id && !p.ips.is_empty())
-    {
+    let index = state.tailnet_index();
+    let mut out: Vec<Candidate> = Vec::new();
+    for p in peers.iter().filter(|p| p.online && !p.ips.is_empty()) {
+        // A machine on several of our tailnets shows up once per tailnet
+        // under different ids; key on the fleet id from its facts.
+        let id = state.canonical_id(&index, p);
+        if id == state.me.node_id || out.iter().any(|c| c.key == id) {
+            continue;
+        }
         let facts = state
             .store
-            .get(&keys::node_facts(&p.node_id))
+            .get(&keys::node_facts(&id))
             .ok()
             .flatten()
             .and_then(|r| r.parse::<NodeFacts>().ok());
         let (url, known) = match facts {
+            // Dial the address this peer has on the tailnet that reported it.
             Some(f) => (peer_url(&p.ips, f.port), true),
             None => (peer_url(&p.ips, state.cfg.port), false),
         };
         if let Some(url) = url {
             out.push(Candidate {
-                key: p.node_id.clone(),
+                key: id,
                 name: p.name.clone(),
                 url,
                 known,
