@@ -1,5 +1,6 @@
 //! flotillad: the per-node fleet daemon.
 
+mod alerts;
 mod auth;
 mod config;
 mod exec;

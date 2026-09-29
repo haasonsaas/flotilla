@@ -84,6 +84,12 @@ enum Cmd {
     /// Agent runs: jobs that execute inside tmux sessions on the least loaded node
     #[command(subcommand)]
     Agent(commands::AgentCmd),
+    /// Watchdog alerts raised by nodes (disk free, tailscale login, load)
+    Alerts {
+        /// Include alerts that have cleared
+        #[arg(long)]
+        all: bool,
+    },
     /// Remove the user service
     Uninstall,
 }
@@ -115,6 +121,7 @@ async fn main() -> Result<()> {
         Cmd::Agent(cmd) => commands::agent(&client, cmd, cli.json).await,
         Cmd::Batch(cmd) => commands::batch(&client, cmd, cli.json).await,
         Cmd::Web { node, print } => commands::web(&client, node.as_deref(), print).await,
+        Cmd::Alerts { all } => commands::alerts(&client, all, cli.json).await,
         Cmd::Uninstall => install::uninstall().await,
     }
 }
