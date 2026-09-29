@@ -226,6 +226,17 @@ pub struct JobSpec {
     /// Why the job was cancelled, when the fleet did it (dependency failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<String>,
+    /// Affinity placement: among eligible nodes prefer the one holding this
+    /// warm cache (`warm` in its facts), freshest first, then least loaded.
+    /// Nodes at their `max_jobs` cap are passed over. Falls back to plain
+    /// least-load when no eligible node holds the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_warm: Option<String>,
+    /// With `prefer_warm`: the cache key the job wants (e.g. a commit). A
+    /// node whose key equals it, or is a prefix of it or extends it, wins
+    /// over a merely fresher cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_key: Option<String>,
 }
 
 /// `claim/<id>`: written by a node that intends to run the job.
@@ -408,6 +419,8 @@ mod tests {
             retries: 0,
             retry: 0,
             cancel_reason: None,
+            prefer_warm: None,
+            warm_key: None,
         }
     }
 
