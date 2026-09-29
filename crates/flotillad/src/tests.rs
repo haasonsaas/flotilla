@@ -28,7 +28,17 @@ async fn free_port() -> u16 {
 }
 
 async fn node(name: &str, port: u16, peers: Vec<(&str, u16)>, dir: &std::path::Path) -> Node {
-    let cfg = Config {
+    node_with(name, port, peers, dir, |_| {}).await
+}
+
+async fn node_with(
+    name: &str,
+    port: u16,
+    peers: Vec<(&str, u16)>,
+    dir: &std::path::Path,
+    tweak: impl FnOnce(&mut Config),
+) -> Node {
+    let mut cfg = Config {
         port,
         data_dir: dir.join(name),
         identity: "static".into(),
@@ -54,6 +64,7 @@ async fn node(name: &str, port: u16, peers: Vec<(&str, u16)>, dir: &std::path::P
         }),
         ..Config::default()
     };
+    tweak(&mut cfg);
     std::fs::create_dir_all(cfg.jobs_dir()).unwrap();
     let identity = Arc::new(IdentityProvider::from_config(&cfg).unwrap());
     let me = identity.me().await.unwrap();
@@ -1022,6 +1033,42 @@ async fn least_load_defers_to_a_less_loaded_peer() {
         a.state.store.get(&keys::claim(&spec.id)).unwrap().is_some()
     })
     .await;
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warm_cache_is_published_in_facts_and_labels() {
+    let dir = tmp();
+    let cache = dir.join("target");
+    std::fs::create_dir_all(cache.join("debug")).unwrap();
+    let cache_cfg = cache.clone();
+    let a = node_with("solo", free_port().await, vec![], &dir, move |c| {
+        c.warm_cache = vec![
+            crate::config::WarmCacheConfig {
+                name: "mono-rust".into(),
+                path: cache_cfg,
+                key_cmd: Some("echo abc1234".into()),
+            },
+            crate::config::WarmCacheConfig {
+                name: "absent".into(),
+                path: "/nonexistent/flotilla-warm".into(),
+                key_cmd: None,
+            },
+        ];
+    })
+    .await;
+    eventually("warm facts", || {
+        a.state
+            .my_facts()
+            .map(|f| f.warm.contains_key("mono-rust"))
+            .unwrap_or(false)
+    })
+    .await;
+    let f = a.state.my_facts().unwrap();
+    assert_eq!(f.warm["mono-rust"].key, "abc1234");
+    assert!(!f.warm.contains_key("absent"));
+    assert!(f.labels["warm.mono-rust"].starts_with("abc1234@"));
+    assert!(!f.labels.contains_key("warm.absent"));
     std::fs::remove_dir_all(dir).ok();
 }
 

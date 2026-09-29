@@ -221,6 +221,22 @@ mid-build (`caffeinate_jobs = false` to disable), and facts carry `xcode=<ver>`
 and `tmux=yes` labels when those tools are present, so `-l xcode=16.2` works
 as a selector.
 
+Nodes can advertise build caches they hold warm. In the node's config:
+
+```toml
+[[warm_cache]]
+name = "mono-rust"
+path = "/builds/mono/target"
+key_cmd = "git -C /builds/mono rev-parse --short HEAD"   # optional
+```
+
+Every facts refresh (`facts_interval_secs`) publishes a label
+`warm.mono-rust=<key>@<age>` (for example `3fa9c1e@12m`; age is time since the
+newest change under the directory) and a structured `warm` field in the node's
+facts with the path, size (recomputed every 5 minutes in the background) and
+last-used time. A cache whose directory does not exist is not advertised.
+`key_cmd` runs under `sh -c` with a 5s limit; its first output line is the key.
+
 A desired-state file:
 
 ```toml
