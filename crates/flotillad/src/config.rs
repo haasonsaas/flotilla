@@ -58,9 +58,26 @@ pub struct Config {
     /// one implicit tailnet reached through `tailscale_bin` / the default
     /// socket.
     pub tailnet: Vec<TailnetConfig>,
+    /// Build caches this node advertises as warm in its facts.
+    pub warm_cache: Vec<WarmCacheConfig>,
     /// "tailscale" (default) or "static" (tests).
     pub identity: String,
     pub static_identity: Option<StaticIdentityConfig>,
+}
+
+/// `[[warm_cache]]`: a build cache directory this node keeps and advertises
+/// as `warm.<name>` in its facts (label `<key>@<age>`, plus size and
+/// last-used time in the structured `warm` field).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WarmCacheConfig {
+    /// Cache name, e.g. `mono-rust`. Jobs ask for it with `--prefer-warm`.
+    pub name: String,
+    /// The cache directory, e.g. `/builds/mono/target`. Not warm if missing.
+    pub path: PathBuf,
+    /// Shell command whose first output line identifies what the cache was
+    /// built from, e.g. `git -C /builds/mono rev-parse --short HEAD`.
+    pub key_cmd: Option<String>,
 }
 
 /// `[[tailnet]]`: one tailnet this node is on.
@@ -239,6 +256,7 @@ impl Default for Config {
             seeds: Vec::new(),
             name: None,
             tailnet: Vec::new(),
+            warm_cache: Vec::new(),
             identity: "tailscale".into(),
             static_identity: None,
         }
@@ -315,6 +333,26 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_warm_cache_tables() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[warm_cache]]
+            name = "mono-rust"
+            path = "/builds/mono/target"
+            key_cmd = "git -C /builds/mono rev-parse --short HEAD"
+            [[warm_cache]]
+            name = "npm"
+            path = "/builds/npm"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.warm_cache.len(), 2);
+        assert_eq!(cfg.warm_cache[0].name, "mono-rust");
+        assert!(cfg.warm_cache[1].key_cmd.is_none());
+        assert!(Config::default().warm_cache.is_empty());
+    }
 
     #[test]
     fn parses_tailnet_tables() {

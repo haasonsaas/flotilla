@@ -57,6 +57,10 @@ pub fn collect(state: &AppState, tailscale: Vec<TailnetHealth>) -> NodeFacts {
     if which_exists("tmux") {
         labels.insert("tmux".into(), "yes".into());
     }
+    let warm = crate::warm::collect(&state.cfg.warm_cache);
+    for (name, w) in &warm {
+        labels.insert(format!("warm.{name}"), w.label_value());
+    }
     for (k, v) in &state.cfg.labels {
         labels.insert(k.clone(), v.clone());
     }
@@ -109,6 +113,7 @@ pub fn collect(state: &AppState, tailscale: Vec<TailnetHealth>) -> NodeFacts {
         sessions: tmux_sessions(),
         lan: lan_interfaces(),
         tailnets: state.me.tailnets.clone(),
+        warm,
         exe_path: std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
