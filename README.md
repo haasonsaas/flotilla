@@ -295,6 +295,33 @@ check = ["brew", "list", "jq"]
 apply = ["brew", "install", "jq"]
 ```
 
+### Recipe: build node
+
+`docs/recipes/build-node.toml` (Linux, systemd user timer) and
+`build-node-macos.toml` (launchd agent) turn a machine into a build node:
+
+```sh
+flotilla desired set olympus -f docs/recipes/build-node.toml
+flotilla desired status
+```
+
+- `~/.local/bin/flotilla-build-clean` deletes each `~/builds/<name>/` that has
+  had no file written in 7 days, every 6 hours. `BUILD_ROOT` and
+  `BUILD_MAX_AGE_DAYS` are set in the unit or plist. The script refuses `/`,
+  `$HOME`, relative paths and a non-numeric age, and leaves loose files alone.
+- `rust-toolchain` installs rustup (minimal profile) if `~/.cargo/bin/cargo`
+  is missing.
+- `sccache` is `cargo install`ed if absent, then `cargo-sccache-wrapper` adds
+  `rustc-wrapper = "sccache"` and `SCCACHE_CACHE_SIZE = "50G"` to
+  `~/.cargo/config.toml`. It does this only once the binary exists, and it
+  fails visibly (instead of editing) when the file already has a `[build]`
+  table.
+
+Every entry is a file or a check/apply pair, so a converged node changes
+nothing on later passes. The reconcile loop runs ensures one at a time, so a
+first `cargo install sccache` holds up that node's next pass for a few
+minutes.
+
 ## How jobs get scheduled without a leader
 
 1. The submitter writes `job/<id>` with a command and either a node pin or a label selector.

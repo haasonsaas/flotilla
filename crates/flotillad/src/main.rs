@@ -10,6 +10,8 @@ mod identity;
 mod notify;
 mod placement;
 mod proxyproto;
+#[cfg(test)]
+mod recipes;
 mod reconcile;
 mod scheduler;
 mod server;

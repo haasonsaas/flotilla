@@ -16,7 +16,7 @@ pub async fn run(state: AppState) {
     }
 }
 
-async fn pass(state: &AppState) -> anyhow::Result<()> {
+pub(crate) async fn pass(state: &AppState) -> anyhow::Result<()> {
     let Some(rec) = state
         .store
         .get(&keys::desired(&state.me.node_id))?
