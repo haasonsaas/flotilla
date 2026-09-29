@@ -9,6 +9,8 @@ mod gc;
 mod identity;
 mod notify;
 mod proxyproto;
+#[cfg(test)]
+mod recipes;
 mod reconcile;
 mod scheduler;
 mod server;

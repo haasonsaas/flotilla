@@ -1,0 +1,86 @@
+# Desired state for a Linux build node: cargo toolchain, sccache wired into
+# cargo, and a systemd user timer that clears stale build directories.
+#
+#   flotilla desired set <node> -f docs/recipes/build-node.toml
+#
+# Builds live in ~/builds/<name>/ (BUILD_ROOT). A directory with no file
+# written in 7 days is removed every 6 hours; change BUILD_ROOT or
+# BUILD_MAX_AGE_DAYS in the service unit below. Every entry is a file or a
+# check/apply pair, so a converged node is left alone. Ensures run in order,
+# and sccache becomes cargo's rustc-wrapper only after the binary exists.
+
+[[files]]
+path = "~/.local/bin/flotilla-build-clean"
+mode = "0755"
+content = '''
+#!/bin/sh
+# Remove build directories under $BUILD_ROOT that have had no file written in
+# the last $BUILD_MAX_AGE_DAYS days. Only direct children are candidates.
+set -eu
+root="${BUILD_ROOT:-$HOME/builds}"
+days="${BUILD_MAX_AGE_DAYS:-7}"
+case "$root" in
+  ""|/|"$HOME"|"$HOME"/) echo "refusing BUILD_ROOT=$root" >&2; exit 2 ;;
+  /*) ;;
+  *) echo "BUILD_ROOT must be absolute" >&2; exit 2 ;;
+esac
+case "$days" in ""|*[!0-9]*) echo "bad BUILD_MAX_AGE_DAYS" >&2; exit 2 ;; esac
+[ -d "$root" ] || exit 0
+for d in "$root"/*/; do
+  [ -d "$d" ] || continue
+  if [ -z "$(find "$d" -type f -mtime -"$days" 2>/dev/null | head -n 1)" ]; then
+    rm -rf "$d"
+  fi
+done
+'''
+
+[[files]]
+path = "~/.config/systemd/user/flotilla-build-clean.service"
+content = '''
+[Unit]
+Description=Remove stale build directories
+
+[Service]
+Type=oneshot
+Environment=BUILD_ROOT=%h/builds
+Environment=BUILD_MAX_AGE_DAYS=7
+ExecStart=%h/.local/bin/flotilla-build-clean
+'''
+
+[[files]]
+path = "~/.config/systemd/user/flotilla-build-clean.timer"
+content = '''
+[Unit]
+Description=Clear stale build directories every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+'''
+
+[[ensure]]
+name = "build-clean-timer"
+check = ["sh", "-c", "systemctl --user is-enabled flotilla-build-clean.timer && systemctl --user is-active flotilla-build-clean.timer"]
+apply = ["sh", "-c", "systemctl --user daemon-reload && systemctl --user enable --now flotilla-build-clean.timer"]
+
+[[ensure]]
+name = "rust-toolchain"
+check = ["sh", "-c", "test -x \"$HOME/.cargo/bin/cargo\""]
+apply = ["sh", "-c", "curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path"]
+
+[[ensure]]
+name = "sccache"
+check = ["sh", "-c", "test -x \"$HOME/.cargo/bin/sccache\""]
+apply = ["sh", "-c", "PATH=\"$HOME/.cargo/bin:$PATH\" cargo install sccache --locked"]
+
+# Appends a [build]/[env] block to ~/.cargo/config.toml, and only when the
+# file has no [build] table of its own (a second one would be invalid TOML).
+# In that case it fails and shows in `flotilla desired status`; merge by hand.
+[[ensure]]
+name = "cargo-sccache-wrapper"
+check = ["sh", "-c", "grep -qs '^rustc-wrapper *= *\"sccache\"' \"$HOME/.cargo/config.toml\""]
+apply = ["sh", "-c", "test -x \"$HOME/.cargo/bin/sccache\" && ! grep -qs '^\\[build\\]' \"$HOME/.cargo/config.toml\" && mkdir -p \"$HOME/.cargo\" && printf '[build]\\nrustc-wrapper = \"sccache\"\\n\\n[env]\\nSCCACHE_CACHE_SIZE = \"50G\"\\n' >> \"$HOME/.cargo/config.toml\""]
