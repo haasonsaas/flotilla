@@ -161,8 +161,8 @@ alerts` lists firing alerts across the fleet, `--all` includes cleared ones.
 Inbound requests from the tailnet are resolved with `tailscale whois`. A caller
 is allowed if its login name is in `allowed_users` or one of its node tags is in
 `allowed_tags`. If neither list is configured the daemon allows only its own
-login, which is the right default for one person's machines. Loopback is
-trusted. Tagged nodes (like a CI box) need a tag entry:
+login, which is the right default for one person's machines. Tagged nodes
+(like a CI box) need a tag entry:
 
 ```toml
 # ~/.config/flotilla/config.toml
@@ -194,7 +194,9 @@ config. A caller not on the allow-lists gets exactly the roles named in the
 ]
 ```
 
-Roles: `read` (status, records, events, logs, file downloads), `write`
+Roles: `view` (status, peers, records, events, the dashboard; implied by
+`read`), `read` (everything in `view` plus job logs, artifacts and file
+downloads), `write`
 (records, so jobs and desired state), `exec` (run processes, upload files),
 `sync` (the peer protocol), `admin` (all). Allow-listed users and tags hold
 every role.
@@ -206,6 +208,42 @@ node that needs to sync with its peers must be granted `sync` as well as
 a live tailnet: with `["read", "sync"]` the daemon accepted sync and refused
 `run` and `push` with `403 ... lacks the exec role`; adding `exec` made them
 pass without restarting anything (the whois cache is 20s).
+
+### Local callers
+
+Loopback is not an identity: any process on the machine, including untrusted
+CI job code, can connect to `127.0.0.1:7400`. So local callers are not trusted
+by address. At start the daemon writes a random token to
+`<data_dir>/local.token` (mode 0600, reused across restarts, rotated if its
+permissions were loosened) and the `flotilla` CLI sends it in the
+`x-flotilla-local-token` header when it talks to a loopback daemon. A local
+caller that presents it holds every role. One that does not holds `view` only,
+so the dashboard at `http://127.0.0.1:7400/` keeps working read-only (the job
+log pane falls back to the result's output tail, and the cancel button reports
+that it is refused; use `flotilla job cancel`). Exec, file upload, wake,
+record writes and import, sync and job submission all need the token. The
+same applies to this machine dialing its own tailnet address.
+
+The token is a file in the daemon user's data directory, so it protects the
+daemon from other users on the machine, not from code running as the same
+user. Run untrusted CI jobs as a different user from the daemon.
+The CLI finds the file via `$FLOTILLA_DATA_DIR`, else `data_dir` in
+`config.toml`; if you start the daemon with `--data-dir`, export
+`FLOTILLA_DATA_DIR` to match. Connections through `proxy_listen` never get
+local trust, even with a PROXY header naming a loopback address.
+
+`trust_loopback = true` in `config.toml` restores the old behavior (every
+loopback caller is the operator). It logs a warning at startup. Leave it off
+on any machine that runs code you do not fully trust.
+
+**Upgrading:** the CLI and daemon must be upgraded together on each node. An old
+CLI against a new daemon gets 403 on exec, push, jobs and the like (reads
+still work); a new CLI against an old daemon works, since the old daemon
+ignores the header. `flotilla upgrade` reaches other nodes over the tailnet,
+authenticated by `whois`, never by loopback, and installs both binaries and
+restarts the daemon, so it works across mixed versions. Upgrade with the new
+CLI, and upgrade the local node last (`--include-self`) or use the new binary
+for it directly.
 
 All keys and defaults are in `crates/flotillad/src/config.rs`.
 

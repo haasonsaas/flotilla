@@ -4,33 +4,121 @@ use flotilla_core::Record;
 use futures::{Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const EXEC_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A reqwest client that adds the local operator token, read fresh from the
+/// token file on each request, so a daemon restart or first start after the
+/// CLI began does not leave it unauthenticated. Only the client for the
+/// local daemon carries a token path; `Client::at` never does, so the token
+/// is not sent to peers.
+#[derive(Clone)]
+struct Http {
+    inner: reqwest::Client,
+    token_path: Option<PathBuf>,
+}
+
+impl Http {
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let token = self
+            .token_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        match token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => match reqwest::header::HeaderValue::from_str(t) {
+                Ok(mut v) => {
+                    v.set_sensitive(true);
+                    rb.header(LOCAL_TOKEN_HEADER, v)
+                }
+                Err(_) => rb,
+            },
+            None => rb,
+        }
+    }
+    fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.auth(self.inner.get(url))
+    }
+    fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.auth(self.inner.post(url))
+    }
+    fn put(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.auth(self.inner.put(url))
+    }
+    fn delete(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.auth(self.inner.delete(url))
+    }
+}
+
+fn build_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()
+        .expect("client")
+}
+
+/// True when `base` points at this machine (so the token may be sent).
+fn is_loopback_base(base: &str) -> bool {
+    reqwest::Url::parse(base)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .is_some_and(|h| {
+            h == "localhost"
+                || h.trim_matches(|c| c == '[' || c == ']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
+/// Where the daemon keeps the local operator token: `$FLOTILLA_DATA_DIR`,
+/// else `data_dir` from the config file, else the default data directory.
+pub fn token_path() -> Option<PathBuf> {
+    let dir = std::env::var_os("FLOTILLA_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(crate::configured_data_dir)
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    directories::BaseDirs::new().map(|b| b.home_dir().join(".local").join("share"))
+                })
+                .map(|d| d.join("flotilla"))
+        })?;
+    Some(dir.join(LOCAL_TOKEN_FILE))
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub base: String,
-    http: reqwest::Client,
+    http: Http,
 }
 
 impl Client {
     pub fn new(base: &str) -> Client {
         Client {
             base: base.trim_end_matches('/').to_string(),
-            http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(3))
-                .tcp_keepalive(Duration::from_secs(30))
-                .build()
-                .expect("client"),
+            http: Http {
+                inner: build_http(),
+                token_path: if is_loopback_base(base) {
+                    token_path()
+                } else {
+                    None
+                },
+            },
         }
     }
 
-    /// A client pointed at another node.
+    /// A client pointed at another node. Peers authenticate us by tailnet
+    /// identity, so the local token is deliberately not carried over.
     pub fn at(&self, base: &str) -> Client {
         Client {
             base: base.trim_end_matches('/').to_string(),
-            http: self.http.clone(),
+            http: Http {
+                inner: self.http.inner.clone(),
+                token_path: None,
+            },
         }
     }
 
@@ -371,4 +459,54 @@ fn urlencode(s: &str) -> String {
 /// Wait without a timer primitive.
 pub async fn pause(d: Duration) {
     let _ = tokio::time::timeout(d, std::future::pending::<()>()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_only_for_loopback_bases() {
+        assert!(is_loopback_base("http://127.0.0.1:7400"));
+        assert!(is_loopback_base("http://localhost:7400"));
+        assert!(is_loopback_base("http://[::1]:7400"));
+        assert!(!is_loopback_base("http://100.64.0.1:7400"));
+        assert!(!is_loopback_base("http://host.example.com:7400"));
+    }
+
+    #[test]
+    fn peers_never_get_the_token() {
+        let c = Client {
+            base: "http://127.0.0.1:7400".into(),
+            http: Http {
+                inner: build_http(),
+                token_path: Some(PathBuf::from("/nonexistent/local.token")),
+            },
+        };
+        assert!(c.http.token_path.is_some());
+        assert!(c.at("http://100.64.0.2:7400").http.token_path.is_none());
+    }
+
+    #[test]
+    fn token_is_read_from_file_per_request() {
+        let dir = std::env::temp_dir().join(format!("flotilla-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LOCAL_TOKEN_FILE);
+        let http = Http {
+            inner: build_http(),
+            token_path: Some(path.clone()),
+        };
+        let hdr = |h: &Http| {
+            h.get("http://127.0.0.1:1/x")
+                .build()
+                .unwrap()
+                .headers()
+                .get(LOCAL_TOKEN_HEADER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(hdr(&http), None, "no file yet");
+        std::fs::write(&path, "abc\n").unwrap();
+        assert_eq!(hdr(&http).as_deref(), Some("abc"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

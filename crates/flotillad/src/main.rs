@@ -97,7 +97,18 @@ async fn main() -> Result<()> {
     )?);
     tracing::info!(node = %me.name, id = %me.node_id, records = store.len()?, "store opened");
 
-    let state = server::AppState::new(cfg.clone(), identity.clone(), store.clone(), me.clone());
+    let mut state = server::AppState::new(cfg.clone(), identity.clone(), store.clone(), me.clone());
+    if cfg.trust_loopback {
+        tracing::warn!(
+            "trust_loopback = true: ANY local process (including CI job code) gets full \
+             control of this node and, through it, the fleet"
+        );
+    }
+    state.local_token = Some(
+        auth::load_or_create_token(&cfg.data_dir)
+            .with_context(|| format!("writing local token in {}", cfg.data_dir.display()))?
+            .into(),
+    );
 
     tokio::spawn(facts::run(state.clone()));
     tokio::spawn(sync_loop::run(state.clone()));

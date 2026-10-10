@@ -5,6 +5,10 @@ use crate::schema::{NodeFacts, TailnetInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// File in the daemon's data directory holding the local operator token.
+pub const LOCAL_TOKEN_FILE: &str = "local.token";
+/// Request header carrying the local operator token.
+pub const LOCAL_TOKEN_HEADER: &str = "x-flotilla-local-token";
 pub const DEFAULT_PORT: u16 = 7400;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
