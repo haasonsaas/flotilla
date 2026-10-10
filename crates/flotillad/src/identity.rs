@@ -695,20 +695,11 @@ impl StaticIdentity {
         })
     }
 
+    /// Only addresses listed in the config resolve. There is deliberately no
+    /// loopback fallback: loopback is not an identity, and `require_peer`
+    /// decides what a local caller may do.
     fn whois(&self, ip: IpAddr) -> Option<WhoIs> {
-        self.by_ip.get(&ip).cloned().or_else(|| {
-            if ip.is_loopback() {
-                Some(WhoIs {
-                    node_id: "loopback".into(),
-                    name: "loopback".into(),
-                    login: self.login.clone(),
-                    tags: vec![],
-                    caps: Default::default(),
-                })
-            } else {
-                None
-            }
-        })
+        self.by_ip.get(&ip).cloned()
     }
 }
 

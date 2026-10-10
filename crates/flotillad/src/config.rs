@@ -17,6 +17,13 @@ pub struct Config {
     /// grant `"app": {"haasonsaas.com/cap/flotilla": [{"roles": ["read"]}]}`.
     /// Callers matched by allowed_users/allowed_tags get every role.
     pub grant_cap: String,
+    /// Escape hatch: treat every loopback caller (and any local process
+    /// connecting to this node's own tailnet address) as the operator, with
+    /// every role. Off by default: any local process, including untrusted CI
+    /// job code, could then run commands on every node in the fleet. Without
+    /// it, local callers get read-only dashboard access unless they present
+    /// the token in `<data_dir>/local.token` (the `flotilla` CLI does).
+    pub trust_loopback: bool,
     /// Extra labels advertised in this node's facts.
     pub labels: Labels,
     /// Path to the tailscale CLI. Auto-detected if unset.
@@ -240,6 +247,7 @@ impl Default for Config {
             allowed_users: Vec::new(),
             allowed_tags: Vec::new(),
             grant_cap: "haasonsaas.com/cap/flotilla".into(),
+            trust_loopback: false,
             labels: Labels::new(),
             tailscale_bin: None,
             max_concurrent_jobs: 2,

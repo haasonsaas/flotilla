@@ -41,6 +41,9 @@ pub struct AppState {
     pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Every applied store change, for `/v1/events` subscribers.
     pub events: tokio::sync::broadcast::Sender<RecordEvent>,
+    /// Local operator token (`<data_dir>/local.token`); `None` means no
+    /// local caller can prove itself except via `trust_loopback`.
+    pub local_token: Option<Arc<str>>,
 }
 
 impl AppState {
@@ -72,6 +75,7 @@ impl AppState {
             sync_state: Arc::new(Mutex::new(HashMap::new())),
             events,
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            local_token: None,
         }
     }
 
@@ -146,20 +150,22 @@ type ApiResult<T> = std::result::Result<T, AppError>;
 
 pub fn router(state: AppState) -> Router {
     use auth::{require_role, Role};
-    let read = Router::new()
+    let view = Router::new()
         .route("/v1/self", get(get_self))
         .route("/v1/peers", get(get_peers))
         .route("/v1/status", get(get_status))
         .route("/v1/records", get(list_records))
         .route("/v1/records/{*key}", get(get_record))
         .route("/v1/syncstate", get(get_sync_state))
+        .route("/v1/events", get(get_events))
+        .route("/", get(get_ui))
+        .route("/ui", get(get_ui))
+        .route_layer(axum::middleware::from_fn(require_role(Role::View)));
+    let read = Router::new()
         .route("/v1/jobs/{id}/log", get(get_job_log))
         .route("/v1/jobs/{id}/artifacts", get(get_artifacts))
         .route("/v1/jobs/{id}/artifacts/{*path}", get(get_artifact))
         .route("/v1/files", get(get_file))
-        .route("/v1/events", get(get_events))
-        .route("/", get(get_ui))
-        .route("/ui", get(get_ui))
         .route_layer(axum::middleware::from_fn(require_role(Role::Read)));
     let write = Router::new()
         .route(
@@ -181,6 +187,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/wake", post(post_wake))
         .route_layer(axum::middleware::from_fn(require_role(Role::Exec)));
     let authed = Router::new()
+        .merge(view)
         .merge(read)
         .merge(write)
         .merge(sync)
@@ -265,7 +272,10 @@ pub async fn serve(state: AppState) -> Result<()> {
         };
         tracing::info!(%listen, tailnet = idx, "listening (PROXY protocol)");
         let listener = ProxyListener::new(listener)?;
-        let app = app.clone().layer(Extension(TailnetCtx(idx)));
+        let app = app
+            .clone()
+            .layer(Extension(TailnetCtx(idx)))
+            .layer(Extension(auth::ViaProxy));
         tasks.push(tokio::spawn(async move {
             axum::serve(
                 listener,

@@ -131,6 +131,19 @@ async fn main() -> Result<()> {
     }
 }
 
+/// `data_dir` from the daemon config file, to find the local operator token.
+pub fn configured_data_dir() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".config")))
+        .map(|d| d.join("flotilla").join("config.toml"))?;
+    let t = std::fs::read_to_string(path)
+        .ok()?
+        .parse::<toml::Table>()
+        .ok()?;
+    t.get("data_dir")?.as_str().map(std::path::PathBuf::from)
+}
+
 /// Port from the daemon config file, so the CLI follows a non-default port
 /// without flags. Only the `port` key is read.
 pub fn configured_port() -> u16 {

@@ -172,7 +172,8 @@ async function refreshDrawer() {
 async function cancel(id) {
   const rec = await j("/v1/records/job/" + id);
   rec.value.cancelled = true;
-  await fetch("/v1/records/job/" + id, { method: "PUT", headers: {"content-type": "application/json"}, body: JSON.stringify({ value: rec.value }) });
+  const r = await fetch("/v1/records/job/" + id, { method: "PUT", headers: {"content-type": "application/json"}, body: JSON.stringify({ value: rec.value }) });
+  if (!r.ok) { alert("cancel refused (" + r.status + "): the local dashboard is read-only; use `flotilla job cancel " + id + "`"); return; }
   render();
 }
 let timer = null;

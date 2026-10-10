@@ -41,6 +41,9 @@ async fn node_with(
     let mut cfg = Config {
         port,
         data_dir: dir.join(name),
+        // Harness nodes reach each other over loopback; the auth tests below
+        // turn this off.
+        trust_loopback: true,
         identity: "static".into(),
         sync_interval_secs: 1,
         job_lease_secs: 3,
@@ -70,7 +73,8 @@ async fn node_with(
     let me = identity.me().await.unwrap();
     let store =
         Arc::new(Store::open(&cfg.data_dir.join("store.redb"), me.node_id.clone()).unwrap());
-    let state = AppState::new(Arc::new(cfg), identity, store, me);
+    let mut state = AppState::new(Arc::new(cfg), identity, store, me);
+    state.local_token = Some(TEST_TOKEN.into());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .unwrap();
@@ -94,6 +98,8 @@ async fn node_with(
     }
 }
 
+const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 type TailnetSpec<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str, u16)>);
 
 /// Like `node`, on several tailnets. Each tailnet is (name, this node's id
@@ -108,6 +114,7 @@ async fn node_on_tailnets(
     let cfg = Config {
         port,
         data_dir: dir.join(name),
+        trust_loopback: true,
         identity: "static".into(),
         sync_interval_secs: 1,
         job_lease_secs: 3,
@@ -1773,4 +1780,192 @@ async fn proxy_listener_reports_the_header_source() {
         !out.contains("200 OK"),
         "unproxied request was served: {out:?}"
     );
+}
+
+fn exec_req() -> ExecRequest {
+    ExecRequest {
+        cmd: vec!["true".into()],
+        ..Default::default()
+    }
+}
+
+/// Loopback is not an identity: without the operator token, a local TCP
+/// caller can read the dashboard data but cannot act.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loopback_without_proof_is_read_only() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node_with("solo", pa, vec![], &dir, |c| c.trust_loopback = false).await;
+    let url = |p: &str| format!("{}{p}", a.base);
+    let h = &a.http;
+
+    // acting routes: 403
+    let r = h
+        .post(url("/v1/exec"))
+        .json(&exec_req())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "exec");
+    let r = h
+        .put(url("/v1/files?path=/tmp/x"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "file put");
+    let r = h
+        .post(url("/v1/wake"))
+        .json(&serde_json::json!({"node": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "wake");
+    let r = h
+        .post(url("/v1/records/import"))
+        .json(&serde_json::json!({"records": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "import");
+    let r = h
+        .put(url("/v1/records/test/hello"))
+        .json(&serde_json::json!({"value": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "record put");
+    let r = h.post(url("/v1/sync")).body("{}").send().await.unwrap();
+    assert_eq!(r.status(), 403, "sync");
+    let r = h.post(url("/v1/syncnow")).body("{}").send().await.unwrap();
+    assert_eq!(r.status(), 403, "syncnow");
+    // logs and file downloads need the Read role
+    let r = h.get(url("/v1/jobs/x/log")).send().await.unwrap();
+    assert_eq!(r.status(), 403, "job log");
+    let r = h
+        .get(url("/v1/files?path=/etc/hosts"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "file get");
+
+    // read-only dashboard routes: 200
+    for p in [
+        "/",
+        "/ui",
+        "/v1/self",
+        "/v1/peers",
+        "/v1/status",
+        "/v1/records?prefix=job/",
+        "/v1/syncstate",
+    ] {
+        let r = h.get(url(p)).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{p}");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A wrong token is no better than none; the right one is the operator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_token_grants_operator() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node_with("solo", pa, vec![], &dir, |c| c.trust_loopback = false).await;
+    let hdr = flotilla_core::api::LOCAL_TOKEN_HEADER;
+    let wrong = "f".repeat(64);
+    let r = a
+        .http
+        .post(format!("{}/v1/exec", a.base))
+        .header(hdr, wrong.as_str())
+        .json(&exec_req())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = a
+        .http
+        .post(format!("{}/v1/exec", a.base))
+        .header(hdr, "short")
+        .json(&exec_req())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = a
+        .http
+        .post(format!("{}/v1/exec", a.base))
+        .header(hdr, TEST_TOKEN)
+        .json(&exec_req())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = a
+        .http
+        .get(format!("{}/v1/jobs/x/log", a.base))
+        .header(hdr, TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(r.status(), 403);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// `trust_loopback = true` restores the old behavior: no proof needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trust_loopback_restores_open_loopback() {
+    let dir = tmp();
+    let pa = free_port().await;
+    let a = node_with("solo", pa, vec![], &dir, |c| c.trust_loopback = true).await;
+    let r = a
+        .http
+        .post(format!("{}/v1/exec", a.base))
+        .json(&exec_req())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn trust_loopback_defaults_off() {
+    assert!(!Config::default().trust_loopback);
+}
+
+/// Behind `proxy_listen` the source address is attacker-controlled by any
+/// local process, so a header claiming loopback must not become the operator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_listener_never_treats_header_loopback_as_operator() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tmp();
+    let pa = free_port().await;
+    // trust_loopback on and a valid token: neither may help on this listener.
+    let a = node_with("solo", pa, vec![], &dir, |c| c.trust_loopback = true).await;
+    let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = inner.local_addr().unwrap();
+    let listener = crate::proxyproto::ProxyListener::new(inner).unwrap();
+    let app = router(a.state.clone())
+        .layer(axum::extract::Extension(crate::auth::TailnetCtx(0)))
+        .layer(axum::extract::Extension(crate::auth::ViaProxy));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<crate::auth::ClientAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let body = serde_json::to_string(&exec_req()).unwrap();
+    let hdr = flotilla_core::api::LOCAL_TOKEN_HEADER;
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "PROXY TCP4 127.0.0.1 127.0.0.1 40000 7400\r\nPOST /v1/exec HTTP/1.1\r\nHost: x\r\n{hdr}: {TEST_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 403"), "got {out:?}");
+    std::fs::remove_dir_all(dir).ok();
 }

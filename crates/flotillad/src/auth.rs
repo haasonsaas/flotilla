@@ -7,7 +7,14 @@
 //!   `grant_cap` in the caller's `whois` CapMap, whose values look like
 //!   `{"roles": ["read", "exec"]}`.
 //!
-//! Loopback callers are the same user on the same machine and get every role.
+//! Loopback is not an identity: any local process, including untrusted CI job
+//! code, can connect to 127.0.0.1. Local callers (loopback, or this node's own
+//! tailnet addresses) therefore get every role only by presenting the local
+//! operator token (`<data_dir>/local.token`, mode 0600, sent by the CLI in the
+//! `x-flotilla-local-token` header), or when `trust_loopback = true`. Without
+//! either they get [`Role::View`] only: status, peers, record reads, the
+//! dashboard. Connections through `proxy_listen` that claim a local source
+//! address are refused, since a local process can forge a PROXY header.
 //! Route groups then require a specific role.
 
 use crate::server::AppState;
@@ -23,7 +30,10 @@ use std::net::SocketAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Role {
-    /// Status, records, peers, events, job logs, file downloads.
+    /// Status, peers, records, events, the dashboard. Implied by `Read`.
+    /// This is all an unauthenticated local caller gets.
+    View,
+    /// Everything in `View`, plus job logs, artifacts and file downloads.
     Read,
     /// The peer sync protocol.
     Sync,
@@ -38,6 +48,7 @@ pub enum Role {
 impl Role {
     fn parse(s: &str) -> Option<Role> {
         match s {
+            "view" => Some(Role::View),
             "read" => Some(Role::Read),
             "sync" => Some(Role::Sync),
             "write" => Some(Role::Write),
@@ -49,6 +60,7 @@ impl Role {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Role::View => "view",
             Role::Read => "read",
             Role::Sync => "sync",
             Role::Write => "write",
@@ -69,14 +81,23 @@ pub struct Caller {
 
 impl Caller {
     pub fn has(&self, role: Role) -> bool {
-        self.roles.contains(&Role::Admin) || self.roles.contains(&role)
+        self.roles.contains(&Role::Admin)
+            || self.roles.contains(&role)
+            || (role == Role::View && self.roles.contains(&Role::Read))
     }
 }
 
 fn all_roles() -> BTreeSet<Role> {
-    [Role::Read, Role::Sync, Role::Write, Role::Exec, Role::Admin]
-        .into_iter()
-        .collect()
+    [
+        Role::View,
+        Role::Read,
+        Role::Sync,
+        Role::Write,
+        Role::Exec,
+        Role::Admin,
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// The caller's address as the listener saw it: the TCP peer for plain
@@ -102,6 +123,11 @@ impl
         ClientAddr(*s.remote_addr())
     }
 }
+
+/// Marks routes served by a PROXY-protocol listener, where the source
+/// address comes from a header any local process can write.
+#[derive(Clone, Copy, Debug)]
+pub struct ViaProxy;
 
 /// Which tailnet (index into the identity provider) a connection arrived
 /// on, attached to each listener's routes. Tailnets can hand out the same
@@ -144,6 +170,63 @@ pub fn roles_for_in(
     roles
 }
 
+/// Create (or reuse) the local operator token in `data_dir`. The file is
+/// created with mode 0600 so only the daemon's user (and root) can read it.
+pub fn load_or_create_token(data_dir: &std::path::Path) -> std::io::Result<String> {
+    use flotilla_core::api::LOCAL_TOKEN_FILE;
+    use std::io::Write;
+    let path = data_dir.join(LOCAL_TOKEN_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let t = existing.trim();
+        if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) && private_file(&path) {
+            return Ok(t.to_string());
+        }
+    }
+    let token = hex::encode(rand::random::<[u8; 32]>());
+    // Write a private temp file, then rename over the old one, so the token
+    // is never readable under looser permissions.
+    let tmp = data_dir.join(format!("{LOCAL_TOKEN_FILE}.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    f.write_all(token.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(token)
+}
+
+#[cfg(unix)]
+fn private_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o077 == 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn private_file(_: &std::path::Path) -> bool {
+    true
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn operator(state: &AppState, roles: BTreeSet<Role>) -> Caller {
+    Caller {
+        node_id: state.me.node_id.clone(),
+        name: "local".into(),
+        login: "local".into(),
+        roles,
+    }
+}
+
 pub async fn require_peer(
     State(state): State<AppState>,
     ConnectInfo(ClientAddr(addr)): ConnectInfo<ClientAddr>,
@@ -151,12 +234,29 @@ pub async fn require_peer(
     next: Next,
 ) -> Response {
     let ip = addr.ip();
-    let caller = if ip.is_loopback() {
-        Caller {
-            node_id: state.me.node_id.clone(),
-            name: "local".into(),
-            login: "local".into(),
-            roles: all_roles(),
+    // Loopback, or this machine dialing its own tailnet address: the source
+    // is a process on this host, not a tailnet peer.
+    let local = ip.is_loopback() || state.me.ips.contains(&ip);
+    let caller = if local {
+        if req.extensions().get::<ViaProxy>().is_some() {
+            tracing::warn!(%ip, "rejected: local source address on a PROXY listener");
+            return reject(
+                StatusCode::FORBIDDEN,
+                "local source address not accepted on the proxy listener".into(),
+            );
+        }
+        let presented = req
+            .headers()
+            .get(flotilla_core::api::LOCAL_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let proven = match (&state.local_token, presented) {
+            (Some(want), Some(got)) => ct_eq(want.as_bytes(), got.trim().as_bytes()),
+            _ => false,
+        };
+        if proven || state.cfg.trust_loopback {
+            operator(&state, all_roles())
+        } else {
+            operator(&state, [Role::View].into_iter().collect())
         }
     } else {
         let tailnet = req.extensions().get::<TailnetCtx>().map_or(0, |c| c.0);
@@ -326,6 +426,50 @@ mod tests {
             all_roles()
         );
         assert!(roles_for_in(&cfg, 1, &who("me@example.com", &[])).is_empty());
+    }
+
+    #[test]
+    fn view_is_implied_by_read_but_not_the_reverse() {
+        let only = |r: Role| Caller {
+            node_id: "n".into(),
+            name: "n".into(),
+            login: "x".into(),
+            roles: [r].into_iter().collect(),
+        };
+        assert!(only(Role::Read).has(Role::View));
+        assert!(only(Role::View).has(Role::View));
+        assert!(!only(Role::View).has(Role::Read));
+        assert!(!only(Role::View).has(Role::Exec));
+    }
+
+    #[test]
+    fn token_file_is_private_stable_and_repaired() {
+        let dir = std::env::temp_dir().join(format!("flotilla-token-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = load_or_create_token(&dir).unwrap();
+        assert_eq!(t.len(), 64);
+        assert_eq!(load_or_create_token(&dir).unwrap(), t, "reused");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(flotilla_core::api::LOCAL_TOKEN_FILE);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            // a token left world-readable is not trusted: rotate it
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let t2 = load_or_create_token(&dir).unwrap();
+            assert_ne!(t2, t);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn constant_time_compare() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
     }
 
     #[test]
